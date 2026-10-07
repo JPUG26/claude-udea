@@ -4,7 +4,7 @@
     <strong>Tu asistente academico con IA para la Universidad de Antioquia</strong>
   </p>
   <p align="center">
-    Descarga automatica de transcripciones de Zoom desde Moodle -> Analisis con Claude Code
+    Descarga automatica de grabaciones de Zoom desde Moodle e Ingenia -> Analisis con IA
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/python-≥3.10-blue?style=flat-square&logo=python&logoColor=white" alt="Python">
@@ -19,7 +19,7 @@
 
 `claude_udea` es una herramienta de linea de comandos que:
 
-1. **Scrapea** las grabaciones de Zoom desde Moodle (UdeArroba)
+1. **Scrapea** las grabaciones de Zoom desde Moodle (UdeArroba) y Virtual Ingenieria (Ingenia)
 2. **Descarga** las transcripciones (y opcionalmente los videos)
 3. **Abre Claude Code** como asistente academico personalizado con tus clases
 
@@ -30,6 +30,7 @@ Todo en un solo comando: `claude_udea`
 ## Caracteristicas
 
 - **Sin navegador** -- login y scraping por HTTP directo, no necesita GUI ni Chromium
+- **Moodle e Ingenia** -- obtiene fechas, duracion y enlace de video de cada plataforma
 - **Pipeline paralelo** -- scrapea materias y descarga grabaciones simultaneamente
 - **Setup interactivo** -- la primera vez te guia para configurar tus asignaturas
 - **Instalacion automatica** -- detecta e instala dependencias faltantes (incluido Claude Code)
@@ -50,6 +51,8 @@ Todo en un solo comando: `claude_udea`
 | **Git** | Clonar el repositorio | [git-scm.com](https://git-scm.com/) |
 
 > Las demas dependencias (yt-dlp, requests, etc.) se instalan automaticamente.
+
+> Para asociar descargas antiguas de Ingenia con las fechas recuperadas, se recomienda tener `ffprobe` (incluido en FFmpeg) en el `PATH`. Es opcional para nuevas descargas.
 
 ### Asistente AI
 
@@ -231,11 +234,13 @@ C:\claude-udea\                   # Windows
     +-- transcripts/              # Transcripciones organizadas
         |-- index.json            # Indice por fecha y asignatura
         |-- calidad-de-software/
-        |   |-- 2026-03-09_Clase 15 [...].vtt
-        |   +-- 2026-03-12_Clase 16 [...].vtt
+        |   |-- Clase #1 - 2026-03-09.transcript.vtt
+        |   +-- Clase #2 - 2026-03-12.transcript.vtt
         +-- ingenieria-web/
             +-- ...
 ```
+
+      Los videos y transcripciones se nombran por asignatura y en orden cronologico, por ejemplo `Clase #1 - 2026-03-09.mp4` y `Clase #1 - 2026-03-09.transcript.vtt`. Las sesiones de Fábrica Escuela agregan el prefijo `Fabrica Escuela -` para distinguirlas, por ejemplo `Fabrica Escuela - Clase #5 - 2026-08-19.mp4`. Al ejecutar de nuevo, los archivos se renumeran si aparece una grabacion anterior.
 
 ---
 
@@ -252,7 +257,7 @@ C:\claude-udea\                   # Windows
 ```
 
 1. **Login**: POST directo con usuario/contrasena, sin navegador. La sesion se guarda localmente.
-2. **Scraping**: requests + BeautifulSoup scrapean las tablas de grabaciones de cada materia en paralelo.
+2. **Scraping**: Moodle se lee desde su tabla de grabaciones; Ingenia se lee desde el payload de datos de su pagina, que incluye todas las grabaciones aunque la interfaz las pagine. Se conservan solo los enlaces de video y se guarda su fecha/hora original.
 3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) en paralelo. Las descargas empiezan a medida que cada scrape termina (pipeline). Cada VTT se enriquece con metadata (fecha, asignatura, duracion).
 4. **Asistente AI**: Se abre Claude Code o Gemini CLI (segun tu eleccion) con instrucciones personalizadas (`CLAUDE.md` / `GEMINI.md`) que le dicen que asignaturas tenes, donde estan las transcripciones, y como responder.
 

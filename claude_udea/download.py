@@ -8,7 +8,9 @@ import re
 import subprocess
 import sys
 import shutil
-from datetime import datetime
+import unicodedata
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -86,30 +88,142 @@ def _extract_rec_id_from_filename(filename: str) -> str:
     return match.group(1) if match else ""
 
 
+def _parse_recording_datetime(value):
+    """Interpreta fechas ISO y formatos habituales de Moodle en español."""
+    if not value:
+        return None
+
+    text = str(value).strip()
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii").lower()
+    months = {
+        "enero": "01", "ene": "01", "febrero": "02", "feb": "02",
+        "marzo": "03", "mar": "03", "abril": "04", "abr": "04",
+        "mayo": "05", "may": "05", "junio": "06", "jun": "06",
+        "julio": "07", "jul": "07", "agosto": "08", "ago": "08",
+        "septiembre": "09", "setiembre": "09", "sep": "09",
+        "octubre": "10", "oct": "10", "noviembre": "11", "nov": "11",
+        "diciembre": "12", "dic": "12",
+    }
+    for month, number in sorted(months.items(), key=lambda item: -len(item[0])):
+        normalized = re.sub(rf"\b{month}\b", number, normalized)
+    normalized = re.sub(r"^[a-z]+,\s*", "", normalized)
+    normalized = re.sub(r"\bde\b", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    formats = (
+        "%d %m %Y, %H:%M", "%d %m %Y %H:%M", "%d/%m/%Y, %H:%M",
+        "%d/%m/%Y %H:%M", "%d %m %Y, %I:%M %p", "%d %m %Y %I:%M %p",
+        "%d/%m/%Y, %I:%M %p", "%d/%m/%Y %I:%M %p", "%d %m %Y",
+        "%d/%m/%Y", "%m %d, %Y, %I:%M %p", "%m %d, %Y",
+    )
+    for date_format in formats:
+        try:
+            return datetime.strptime(normalized, date_format)
+        except ValueError:
+            continue
+    return None
+
+
+def _recording_sort_key(item):
+    rec_id, rec_info = item
+    recording_date = _parse_recording_datetime(rec_info.get("start_date", ""))
+    if recording_date is not None and recording_date.tzinfo is not None:
+        recording_date = recording_date.astimezone(timezone.utc).replace(tzinfo=None)
+    return (recording_date is None, recording_date or datetime.max, rec_id)
+
+
+def _datetime_key(value):
+    parsed = _parse_recording_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.replace(microsecond=0)
+
+
+def _filename_suffix(filename: str, rec_id: str) -> str:
+    """Conserva la extensión y variantes de subtítulo después del ID."""
+    marker = f"[{rec_id}]"
+    if rec_id and marker in filename:
+        return filename.split(marker, 1)[1]
+    id_suffix = re.search(
+        r"\[[^\]]+\](\.(?:transcript|chapter|cc)\.vtt|\.[^.]+)$",
+        filename,
+        re.IGNORECASE,
+    )
+    if id_suffix:
+        return id_suffix.group(1)
+    match = re.match(
+        r"^(?:Fabrica Escuela - )?Clase #\d+ - (?:\d{4}-\d{2}-\d{2}|sin-fecha)(.*)$",
+        filename,
+        re.IGNORECASE,
+    )
+    if not match:
+        return Path(filename).suffix
+
+    suffix = match.group(1)
+    legacy_type = re.match(r"\s*-\s*(video|chapter|transcript|cc)(.*)$", suffix, re.IGNORECASE)
+    if legacy_type:
+        kind, extension = legacy_type.groups()
+        return f".{kind.lower()}{extension}" if kind.lower() != "video" else extension
+    return suffix or Path(filename).suffix
+
+
+def _class_number_from_filename(filename: str):
+    match = re.match(
+        r"^(?:Fabrica Escuela - )?Clase #(\d+) - ",
+        filename,
+        re.IGNORECASE,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _class_filename(meta: dict, date_str: str) -> str:
+    normalized_title = unicodedata.normalize("NFKD", meta.get("title", ""))
+    normalized_title = normalized_title.encode("ascii", "ignore").decode("ascii").lower()
+    category = "Fabrica Escuela - " if "fabrica de escuela" in normalized_title else ""
+    return f"{category}Clase #{meta['class_number']} - {date_str}"
+
+
 def _build_rec_id_map(recordings: dict) -> dict:
     """Mapa de rec_id -> {slug, course_name, start_date, duration, title}."""
     id_map = {}
     for slug, course in recordings.items():
-        for rec_id, rec_info in course.get("recordings", {}).items():
+        ordered_recordings = sorted(
+            course.get("recordings", {}).items(), key=_recording_sort_key
+        )
+        class_number = 0
+        class_by_datetime = {}
+        for rec_id, rec_info in ordered_recordings:
+            date_key = _datetime_key(rec_info.get("start_date", ""))
+            if date_key is not None and date_key in class_by_datetime:
+                recording_class = class_by_datetime[date_key]
+            else:
+                class_number += 1
+                recording_class = class_number
+                if date_key is not None:
+                    class_by_datetime[date_key] = recording_class
             id_map[rec_id] = {
                 "slug": slug,
                 "course_name": course.get("name", slug),
                 "start_date": rec_info.get("start_date", ""),
                 "duration_minutes": rec_info.get("duration_minutes", 0),
                 "title": rec_info.get("title", ""),
+                "class_number": recording_class,
             }
     return id_map
 
 
 def _parse_date_prefix(start_date: str) -> str:
-    """Convierte '2026-03-09T11:00:58Z' a '2026-03-09'."""
-    if not start_date:
-        return "sin-fecha"
-    try:
-        dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d")
-    except (ValueError, TypeError):
-        return "sin-fecha"
+    """Convierte la fecha de Moodle a YYYY-MM-DD para nombres de archivo."""
+    parsed = _parse_recording_datetime(start_date)
+    return parsed.strftime("%Y-%m-%d") if parsed else "sin-fecha"
 
 
 def _inject_vtt_metadata(vtt_content: str, course_name: str, date_str: str,
@@ -146,6 +260,10 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
             recordings = {}
 
     id_map = _build_rec_id_map(recordings)
+    class_map = {
+        (meta["slug"], meta["class_number"]): meta
+        for meta in id_map.values()
+    }
     count = 0
     index = {}
 
@@ -161,15 +279,41 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
         nonlocal count
         rec_id = _extract_rec_id_from_filename(vtt_file.name)
         meta = id_map.get(rec_id, {})
+        if not rec_id:
+            class_number = _class_number_from_filename(vtt_file.name)
+            if class_number:
+                meta = class_map.get((course_slug, class_number), {})
+        if rec_id and not meta:
+            return
+
         date_str = _parse_date_prefix(meta.get("start_date", ""))
         course_name = meta.get("course_name", course_slug)
         duration = meta.get("duration_minutes", 0)
         title = meta.get("title", "")
 
-        new_name = f"{date_str}_{vtt_file.name}"
+        if meta:
+            suffix = _filename_suffix(vtt_file.name, rec_id)
+            new_name = f"{_class_filename(meta, date_str)}{suffix}"
+        else:
+            new_name = f"{date_str}_{vtt_file.name}"
         course_transcripts = transcripts_dir / course_slug
         course_transcripts.mkdir(parents=True, exist_ok=True)
         dest = course_transcripts / new_name
+        if dest.exists():
+            suffix = _filename_suffix(vtt_file.name, rec_id)
+            if not suffix or not new_name.endswith(suffix):
+                suffix = Path(new_name).suffix
+            prefix = new_name[:-len(suffix)] if suffix else new_name
+            duplicate_tag = f" [{rec_id}]" if rec_id else " [duplicate]"
+            candidate = course_transcripts / f"{prefix}{duplicate_tag}{suffix}"
+            duplicate_number = 2
+            while candidate.exists():
+                candidate = course_transcripts / (
+                    f"{prefix}{duplicate_tag} {duplicate_number}{suffix}"
+                )
+                duplicate_number += 1
+            dest = candidate
+            new_name = dest.name
 
         vtt_content = vtt_file.read_text(encoding="utf-8", errors="replace")
         enriched = _inject_vtt_metadata(vtt_content, course_name, date_str, duration, title)
@@ -183,6 +327,7 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
         index[course_slug]["files"].append({
             "file": new_name,
             "date": date_str,
+            "class_number": meta.get("class_number"),
             "topic": title,
             "duration_minutes": duration,
             "type": vtt_type,
@@ -213,6 +358,209 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
             json.dump(index, f, indent=2, ensure_ascii=False)
 
     return count
+
+
+def rename_downloads(download_dir: Path, recordings: dict) -> int:
+    """Renombra descargas por clase y guarda sus rutas para futuras renumeraciones."""
+    id_map = _build_rec_id_map(recordings)
+    renamed_count = 0
+
+    for slug, course in recordings.items():
+        course_dir = download_dir / slug
+        if not course_dir.is_dir():
+            continue
+
+        plans = []
+        record_files = {}
+        for rec_id, rec_info in course.get("recordings", {}).items():
+            meta = id_map.get(rec_id)
+            if not meta:
+                continue
+
+            sources = {}
+            for relative_name in rec_info.get("organized_files", []):
+                source = course_dir / relative_name
+                if source.is_file():
+                    sources[source] = _filename_suffix(source.name, rec_id)
+
+            for source in course_dir.rglob("*"):
+                if source.is_file() and f"[{rec_id}]" in source.name:
+                    sources[source] = _filename_suffix(source.name, rec_id)
+
+            organized_files = []
+            record_files[rec_id] = (rec_info, organized_files)
+            date_str = _parse_date_prefix(meta["start_date"])
+            for source, suffix in sources.items():
+                destination = source.with_name(f"{_class_filename(meta, date_str)}{suffix}")
+                plans.append((source, destination, rec_id, rec_info, organized_files))
+
+        source_paths = {source for source, _, _, _, _ in plans}
+        reserved_destinations = set()
+        resolved_plans = []
+        for source, destination, rec_id, rec_info, organized_files in plans:
+            if destination in reserved_destinations or (
+                destination.exists() and destination not in source_paths
+            ):
+                suffix = _filename_suffix(destination.name, "")
+                if not suffix or not destination.name.endswith(suffix):
+                    suffix = destination.suffix
+                base_name = destination.name[:-len(suffix)] if suffix else destination.name
+                duplicate_number = 1
+                while destination in reserved_destinations or (
+                    destination.exists() and destination not in source_paths
+                ):
+                    duplicate_tag = f" [{rec_id}]" if duplicate_number == 1 else f" [{rec_id} copy {duplicate_number}]"
+                    destination = destination.with_name(
+                        f"{base_name}{duplicate_tag}{suffix}"
+                    )
+                    duplicate_number += 1
+            reserved_destinations.add(destination)
+            resolved_plans.append(
+                (source, destination, rec_id, rec_info, organized_files)
+            )
+
+        staged_plans = []
+        for source, destination, rec_id, rec_info, organized_files in resolved_plans:
+            if source == destination:
+                organized_files.append(destination.relative_to(course_dir).as_posix())
+                continue
+            temporary = source.with_name(f".{source.name}.{uuid.uuid4().hex}.tmp")
+            source.rename(temporary)
+            staged_plans.append(
+                (temporary, destination, rec_id, rec_info, organized_files)
+            )
+
+        for temporary, destination, rec_id, rec_info, organized_files in staged_plans:
+            temporary.rename(destination)
+            renamed_count += 1
+            organized_files.append(destination.relative_to(course_dir).as_posix())
+
+        for rec_id, (rec_info, organized_files) in record_files.items():
+            if organized_files:
+                rec_info["organized_files"] = organized_files
+
+    return renamed_count
+
+
+def backfill_recording_metadata(course_dir: Path, course: dict, links: list[dict]) -> int:
+    """Asocia archivos antiguos con metadata por creation_time exacto del MP4."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not course_dir.is_dir():
+        return 0
+
+    videos_by_datetime = {}
+    for video in course_dir.rglob("*.mp4"):
+        try:
+            result = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-show_entries",
+                    "format_tags=creation_time", "-of", "json", str(video),
+                ],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=15,
+            )
+            if result.returncode != 0:
+                continue
+            tags = json.loads(result.stdout).get("format", {}).get("tags", {})
+            date_key = _datetime_key(tags.get("creation_time", ""))
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+            continue
+        if date_key is not None:
+            videos_by_datetime.setdefault(date_key, []).append(video)
+
+    if not videos_by_datetime:
+        return 0
+
+    owners = {}
+    records_by_datetime = {}
+    for rec_info in course.get("recordings", {}).values():
+        date_key = _datetime_key(rec_info.get("start_date", ""))
+        if date_key is not None:
+            records_by_datetime.setdefault(date_key, []).append(rec_info)
+        for relative_name in rec_info.get("organized_files", []):
+            key = str(relative_name).replace("\\", "/").casefold()
+            owners.setdefault(key, []).append(rec_info)
+
+    link_dates = {
+        _datetime_key(link.get("start_date", ""))
+        for link in links
+        if _datetime_key(link.get("start_date", "")) is not None
+    }
+    metadata_links = list(links)
+    for date_key, rec_infos in records_by_datetime.items():
+        if date_key in link_dates:
+            continue
+        rec_info = rec_infos[0]
+        metadata_links.append({
+            "start_date": rec_info.get("start_date", ""),
+            "title": rec_info.get("title", ""),
+            "duration_minutes": rec_info.get("duration_minutes", 0),
+        })
+
+    backfilled = 0
+    for link in metadata_links:
+        date_key = _datetime_key(link.get("start_date", ""))
+        matching_videos = videos_by_datetime.get(date_key, [])
+        if not matching_videos:
+            continue
+
+        assets = set(matching_videos)
+        class_numbers = set()
+        recording_ids = set()
+        for video in matching_videos:
+            class_number = _class_number_from_filename(video.name)
+            if class_number is not None:
+                class_numbers.add(str(class_number))
+            rec_id = _extract_rec_id_from_filename(video.name)
+            if rec_id:
+                recording_ids.add(rec_id)
+
+        for asset in course_dir.rglob("*"):
+            if not asset.is_file():
+                continue
+            class_number = _class_number_from_filename(asset.name)
+            rec_id = _extract_rec_id_from_filename(asset.name)
+            if (class_number is not None and str(class_number) in class_numbers) or (
+                rec_id and rec_id in recording_ids
+            ):
+                assets.add(asset)
+
+        asset_names = sorted(
+            asset.relative_to(course_dir).as_posix() for asset in assets
+        )
+        matching_records = {
+            id(rec_info): rec_info
+            for rec_info in records_by_datetime.get(date_key, [])
+        }
+        unowned_assets = []
+        for relative_name in asset_names:
+            asset_owners = owners.get(relative_name.casefold(), [])
+            if asset_owners:
+                for rec_info in asset_owners:
+                    matching_records[id(rec_info)] = rec_info
+            else:
+                unowned_assets.append(relative_name)
+
+        if matching_records:
+            for index, rec_info in enumerate(matching_records.values()):
+                rec_info["start_date"] = link["start_date"]
+                rec_info["title"] = link.get("title") or rec_info.get("title", "")
+                rec_info["duration_minutes"] = link.get(
+                    "duration_minutes", rec_info.get("duration_minutes", 0)
+                )
+                existing_files = set(rec_info.get("organized_files", []))
+                if index == 0:
+                    existing_files.update(unowned_assets)
+                rec_info["organized_files"] = sorted(existing_files)
+                if any(Path(name).suffix.lower() == ".mp4" for name in rec_info["organized_files"]):
+                    rec_info["downloaded"] = True
+                backfilled += 1
+        else:
+            link["_existing_files"] = asset_names
+            link["_already_downloaded"] = True
+            backfilled += 1
+
+    return backfilled
 
 
 def count_transcripts(download_dir: Path, slug: str) -> int:

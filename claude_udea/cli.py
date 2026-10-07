@@ -11,6 +11,9 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
+
+import requests
 
 
 # Fix encoding for Windows console
@@ -99,7 +102,7 @@ Eres un asistente academico especializado para un estudiante de la Universidad d
 ## Fechas y metadata
 
 Cada archivo VTT tiene la fecha de la clase de tres formas:
-1. **En el nombre del archivo**: prefijo `YYYY-MM-DD_` (ej: `2026-03-09_CALIDAD...vtt`)
+1. **En el nombre del archivo**: `Clase #N - YYYY-MM-DD` (ej: `Clase #1 - 2026-03-09.transcript.vtt`)
 2. **Dentro del archivo**: bloque `NOTE` al inicio con fecha, asignatura, tema y duracion
 3. **En el indice**: `downloads/transcripts/index.json` tiene un listado completo ordenado por fecha
 
@@ -277,6 +280,11 @@ def _merge_scraped(existing, config, slug, links):
         }
 
     course_data = existing[slug]
+    from claude_udea.download import backfill_recording_metadata
+    backfill_recording_metadata(
+        Path(config["download_dir"]) / slug, course_data, links
+    )
+
     known_dates = {
         rec["start_date"]
         for rec in course_data["recordings"].values()
@@ -289,8 +297,21 @@ def _merge_scraped(existing, config, slug, links):
         start_date = link.get("start_date", "")
 
         if rec_id in course_data["recordings"]:
-            course_data["recordings"][rec_id]["url"] = link["full_url"]
-            course_data["recordings"][rec_id]["share_url"] = link["url"]
+            rec_info = course_data["recordings"][rec_id]
+            rec_info["url"] = link["full_url"]
+            rec_info["share_url"] = link["url"]
+            rec_info["title"] = link.get("topic") or link["text"] or rec_info.get("title", "")
+            rec_info["meeting_id"] = link.get("meeting_id") or rec_info.get("meeting_id", "")
+            rec_info["start_date"] = start_date or rec_info.get("start_date", "")
+            duration = link.get("duration_minutes")
+            if duration or not rec_info.get("duration_minutes"):
+                rec_info["duration_minutes"] = duration or 0
+            if link.get("_existing_files"):
+                rec_info["organized_files"] = sorted(
+                    set(rec_info.get("organized_files", []))
+                    | set(link["_existing_files"])
+                )
+                rec_info["downloaded"] = True
             continue
         if start_date and start_date in known_dates:
             continue
@@ -303,12 +324,14 @@ def _merge_scraped(existing, config, slug, links):
             "start_date": start_date,
             "duration_minutes": link.get("duration_minutes", 0),
             "scraped_at": datetime.now().isoformat(),
-            "downloaded": False,
+            "downloaded": bool(link.get("_already_downloaded")),
         }
+        if link.get("_existing_files"):
+            rec_info["organized_files"] = link["_existing_files"]
         course_data["recordings"][rec_id] = rec_info
         known_dates.add(start_date)
         url = rec_info.get("url") or rec_info.get("share_url", "")
-        if url:
+        if url and not rec_info["downloaded"]:
             new_pending.append((slug, rec_id, rec_info, url))
 
     course_data["last_scraped"] = datetime.now().isoformat()
@@ -335,7 +358,11 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
     # Login solo si vamos a scrapear
     session = None
     if not skip_scrape:
-        session = login(work_dir)
+        has_moodle_courses = any(
+            urlparse(info.get("moodle_url", "")).hostname != "ingenia.udea.edu.co"
+            for info in courses_to_scrape.values()
+        )
+        session = login(work_dir) if has_moodle_courses else requests.Session()
 
     # Contar ya descargadas
     already = 0
@@ -469,12 +496,14 @@ def _get_assistant(config) -> str:
 
 
 def fase_final(config, recordings, target_courses):
-    from claude_udea.download import copy_transcripts, count_transcripts
+    from claude_udea.download import copy_transcripts, count_transcripts, rename_downloads
 
     download_dir = Path(config["download_dir"])
 
     with Spinner("Organizando transcripciones..."):
+        rename_downloads(download_dir, recordings)
         copy_transcripts(download_dir, recordings)
+        save_recordings(Path(config["recordings_file"]), recordings)
 
     total_vtts = 0
     for slug in target_courses:

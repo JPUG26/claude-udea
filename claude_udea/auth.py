@@ -9,6 +9,7 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -170,9 +171,96 @@ def login(work_dir: Path, username: str = None, password: str = None) -> request
     return session
 
 
+def _ingenia_recordings_from_html(html: str) -> list[dict]:
+    """Lee el arreglo completo de grabaciones serializado por Next.js."""
+    soup = BeautifulSoup(html, "html.parser")
+    decoder = json.JSONDecoder()
+
+    for script in soup.find_all("script"):
+        script_text = script.string or script.get_text()
+        match = re.search(r"self\.__next_f\.push\((.*)\);?\s*$", script_text, re.DOTALL)
+        if not match:
+            continue
+
+        try:
+            push_data = json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(push_data, list) or len(push_data) < 2:
+            continue
+
+        payload = push_data[1]
+        if not isinstance(payload, str):
+            continue
+        marker = '"recordings":['
+        marker_index = payload.find(marker)
+        if marker_index < 0:
+            continue
+
+        array_start = payload.find("[", marker_index)
+        try:
+            recordings, _ = decoder.raw_decode(payload, array_start)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(recordings, list) and recordings:
+            return recordings
+
+    return []
+
+
+def _scrape_ingenia(session: requests.Session, slug: str,
+                    course_info: dict) -> tuple[str, list[dict]]:
+    """Extrae todas las grabaciones de una página de Virtual Ingeniería."""
+    try:
+        response = session.get(course_info["moodle_url"], timeout=30)
+        response.raise_for_status()
+    except Exception as error:
+        print(f"  ⚠ Error accediendo a {course_info['name']} en Ingenia: {error}")
+        return slug, []
+
+    recordings = _ingenia_recordings_from_html(response.text)
+    if not recordings:
+        print(f"  ⚠ No se encontró metadata de grabaciones en {course_info['name']} (Ingenia)")
+        return slug, []
+
+    links = []
+    seen = set()
+    for recording in recordings:
+        video_url = recording.get("videoUrl", "")
+        if not video_url:
+            continue
+
+        match = re.search(r"/rec/(?:share|play)/([^?\s]+)", video_url)
+        rec_id = match.group(1) if match else video_url
+        if rec_id in seen:
+            continue
+        seen.add(rec_id)
+
+        start_date = recording.get("startTime", "")
+        if isinstance(start_date, str) and start_date.startswith("$D"):
+            start_date = start_date[2:]
+
+        title = recording.get("topic") or course_info["name"]
+        links.append({
+            "url": video_url.split("?")[0],
+            "full_url": video_url,
+            "text": title,
+            "id": rec_id,
+            "meeting_id": recording.get("id", ""),
+            "topic": title,
+            "start_date": start_date,
+            "duration_minutes": int(recording.get("duration") or 0),
+        })
+
+    return slug, links
+
+
 def _scrape_one(session: requests.Session, slug: str, course_info: dict) -> tuple[str, list[dict]]:
     """Scrapea una materia. Diseñado para correr en un thread."""
     url = course_info["moodle_url"]
+    if urlparse(url).hostname == "ingenia.udea.edu.co":
+        return _scrape_ingenia(session, slug, course_info)
+
     try:
         r = session.get(url, timeout=30)
         r.raise_for_status()
