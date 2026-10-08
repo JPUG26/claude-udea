@@ -395,8 +395,21 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 slug, links = future.result()
                 course_name = config["courses"][slug]["name"]
 
-                # Merge y obtener pendientes nuevos
-                new_pending = _merge_scraped(existing, config, slug, links)
+                is_ingenia = urlparse(
+                    config["courses"][slug].get("moodle_url", "")
+                ).hostname == "ingenia.udea.edu.co"
+                if is_ingenia and not links:
+                    previous_count = len(
+                        existing.get(slug, {}).get("recordings", {})
+                    )
+                    print(
+                        f"  ⚠ {course_name}: respuesta vacía de Ingenia; "
+                        f"se conserva el estado previo ({previous_count} grabaciones)"
+                    )
+                    new_pending = []
+                else:
+                    # Merge y obtener pendientes nuevos
+                    new_pending = _merge_scraped(existing, config, slug, links)
 
                 # Filtrar los que ya están descargados
                 pending = []
@@ -417,7 +430,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                             pending.append((slug, rec_id, rec_info, url))
 
                 total_new += len(new_pending)
-                print(f"  ✔ {course_name}: {len(links)} grabaciones, {len(pending)} pendientes")
+                if not (is_ingenia and not links):
+                    print(f"  ✔ {course_name}: {len(links)} grabaciones, {len(pending)} pendientes")
 
                 # Lanzar descargas en paralelo
                 for item in pending:
@@ -572,6 +586,73 @@ def fase_final(config, recordings, target_courses, assistant_override=None, olla
         print(f"  O abri manualmente en: {work_dir.resolve()}")
 
 
+def _sync_moodle_materials(work_dir: Path, config: dict, target_courses: list[str]):
+    from claude_udea.auth import login, migrate_saved_secrets
+    from claude_udea.materials import scrape_course_materials
+
+    moodle_courses = {
+        slug: config["courses"][slug]
+        for slug in target_courses
+        if urlparse(config["courses"][slug].get("moodle_url", "")).hostname
+        == "udearroba.udea.edu.co"
+    }
+    ingenia_courses = set(target_courses) - set(moodle_courses)
+    if not moodle_courses:
+        print("  No hay asignaturas Moodle en la selección para descargar materiales.\n")
+        return
+
+    if ingenia_courses:
+        print(
+            "  Ingenia: se omiten los materiales del curso; la configuración actual "
+            "solo contiene enlaces públicos de reuniones Zoom."
+        )
+
+    session = login(work_dir)
+    materials_root = Path(config["download_dir"]).parent / "course-materials"
+    failures = 0
+    for slug, course_info in moodle_courses.items():
+        destination = materials_root / slug
+        try:
+            manifest = scrape_course_materials(session, course_info, destination)
+        except Exception as error:
+            failures += 1
+            print(f"  ⚠ {course_info['name']}: no se pudo recorrer el curso: {error}")
+            continue
+        course_failures = len(manifest["failures"])
+        failures += course_failures
+        print(
+            f"  ✔ {course_info['name']}: {manifest['file_count']} archivos, "
+            f"{manifest['page_count']} páginas, "
+            f"{manifest['external_link_count']} enlaces externos, "
+            f"{course_failures} fallos"
+        )
+        print(f"    {destination}")
+
+    migrated = migrate_saved_secrets(work_dir)
+    if migrated:
+        print("  ✔ Sesiones y credenciales migradas a Windows Credential Manager.")
+        print("    Se eliminaron los JSON legados solo después de verificar el almacén seguro.")
+    if failures:
+        print(f"  ⚠ La sincronización terminó con {failures} elementos que requieren revisión.\n")
+    else:
+        print("  ✔ Materiales Moodle sincronizados.\n")
+
+
+def _sync_ingenia_materials(work_dir: Path, course_url: str):
+    from claude_udea.ingenia import sync_course_materials
+
+    manifest = sync_course_materials(course_url, work_dir)
+    print(
+        f"  ✔ Ingenia: {manifest['file_count']} archivos, "
+        f"{manifest['page_count']} páginas, "
+        f"{manifest['external_link_count']} enlaces externos, "
+        f"{len(manifest['failures'])} fallos"
+    )
+    print(f"    {work_dir / 'course-materials' / f"ingenia-{manifest['course_id']}"}")
+    if manifest["failures"]:
+        print("  ⚠ Algunos recursos no pudieron descargarse; revisa el manifest.json.\n")
+
+
 # ─── Main ────────────────────────────────────────────────────
 
 def main():
@@ -586,9 +667,51 @@ def main():
         print("  --ollama-model requiere --ollama.\n")
         sys.exit(2)
 
+    sync_materials_only = "--sync-materials" in args
+    sync_ingenia_only = "--sync-ingenia-materials" in args
+    if sync_materials_only and sync_ingenia_only:
+        print("  Usa --sync-materials o --sync-ingenia-materials, no ambos.\n")
+        sys.exit(2)
+    if sync_ingenia_only:
+        from claude_udea.deps import check_and_install
+        if not check_and_install(skip_assistant=True):
+            sys.exit(1)
+        work_dir = _get_work_dir()
+        url_index = args.index("--sync-ingenia-materials") + 1
+        if url_index >= len(args) or args[url_index].startswith("--"):
+            print("  Uso: claude_udea --sync-ingenia-materials <URL-del-curso>\n")
+            sys.exit(2)
+        try:
+            _sync_ingenia_materials(work_dir, args[url_index])
+        except (PermissionError, RuntimeError, ValueError) as error:
+            print(f"  ⚠ {error}\n")
+            sys.exit(1)
+        return
+    if sync_materials_only:
+        from claude_udea.deps import check_and_install
+        if not check_and_install(skip_assistant=True):
+            sys.exit(1)
+        work_dir = _get_work_dir()
+        config = load_config(work_dir)
+        course_args = [
+            arg for arg in args
+            if not arg.startswith("--") and arg not in {"--sync-materials"}
+        ]
+        all_courses = list(config["courses"].keys())
+        unknown_courses = [slug for slug in course_args if slug not in config["courses"]]
+        if unknown_courses:
+            print(f"  Asignaturas no encontradas: {', '.join(unknown_courses)}")
+            print(f"  Disponibles: {', '.join(all_courses)}\n")
+            sys.exit(2)
+        _sync_moodle_materials(work_dir, config, course_args or all_courses)
+        return
+
     # Validar dependencias
     from claude_udea.deps import check_and_install
-    if not check_and_install(skip_assistant=use_ollama or no_assistant):
+    if not check_and_install(
+        skip_assistant=use_ollama or no_assistant,
+        require_whisper="--always-whisper" in args,
+    ):
         sys.exit(1)
 
     import questionary
@@ -610,6 +733,8 @@ def main():
     skip_video_flag = "--skip-video" in args
     download_all_flag = "--all" in args
     add_course_flag = "--add-course" in args
+    skip_materials = "--skip-materials" in args
+    always_whisper = "--always-whisper" in args
 
     if add_course_flag:
         from claude_udea.setup import add_course
@@ -681,6 +806,31 @@ def main():
         work_dir, config, recordings_path, target_courses, skip_video, dry_run,
         skip_scrape=skip_scrape,
     )
+
+    if always_whisper and not dry_run:
+        from transcribe_missing import has_zoom_transcripts, transcribe_all
+        try:
+            keep_zoom_transcripts = False
+            if has_zoom_transcripts(work_dir, target_courses):
+                keep_zoom_transcripts = questionary.confirm(
+                    "Hay transcripciones de Zoom. ¿Conservarlas además de las de faster-whisper?",
+                    default=True,
+                ).ask()
+                if keep_zoom_transcripts is None:
+                    sys.exit(0)
+            whisper_ok, whisper_failed = transcribe_all(
+                work_dir,
+                target_courses,
+                keep_zoom_transcripts=keep_zoom_transcripts,
+            )
+            failed += whisper_failed
+            print(f"  faster-whisper: {whisper_ok} completadas, {whisper_failed} fallidas.\n")
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"  ⚠ No se pudo iniciar faster-whisper: {error}\n")
+            failed += 1
+
+    if not dry_run and not skip_materials:
+        _sync_moodle_materials(work_dir, config, target_courses)
 
     # Organizar transcripciones + asistente elegido
     if not dry_run:

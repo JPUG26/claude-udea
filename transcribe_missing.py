@@ -5,7 +5,7 @@ tienen transcript de Zoom (.transcript.vtt) ni subtítulos (.cc.vtt).
 
 Flujo por grabación:
   1. Descarga el video de Zoom con yt-dlp (formato 'view', el más liviano).
-  2. Extrae audio 16 kHz mono con ffmpeg y borra el video.
+    2. Extrae audio 16 kHz mono con ffmpeg; conserva los videos ya organizados.
   3. Transcribe con faster-whisper (small, int8, VAD) y escribe
      'TITULO [REC_ID].transcript.vtt' en downloads/<asignatura>/.
   4. Borra el audio y regenera downloads/transcripts/ + index.json
@@ -19,8 +19,11 @@ Uso:
 """
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -52,11 +55,8 @@ def fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def has_transcript(course_dir: Path, rec_id: str) -> bool:
-    for vtt in course_dir.glob("*.vtt"):
-        if rec_id in vtt.name and (".transcript." in vtt.name or ".cc." in vtt.name):
-            return True
-    return False
+def has_transcript(course_dir: Path, rec_id: str, rec_info: dict | None = None) -> bool:
+    return bool(_recording_transcripts(course_dir, rec_id, rec_info or {}))
 
 
 def find_missing(work_dir: Path):
@@ -69,7 +69,7 @@ def find_missing(work_dir: Path):
     for slug, course in recordings.items():
         course_dir = download_dir / slug
         for rec_id, info in course.get("recordings", {}).items():
-            if not has_transcript(course_dir, rec_id):
+            if not has_transcript(course_dir, rec_id, info):
                 missing.append({
                     "slug": slug,
                     "rec_id": rec_id,
@@ -83,24 +83,32 @@ def find_missing(work_dir: Path):
 
 
 def download_video(rec, cache_dir: Path) -> Path | None:
-    ytdlp = TOOL_DIR / ".venv" / "bin" / "yt-dlp"
+    cache_dir.mkdir(parents=True, exist_ok=True)
     out_tpl = str(cache_dir / "%(title)s [%(id)s].%(ext)s")
     for fmt in (["-f", "view"], []):  # 'view' es el stream más liviano; sin -f como fallback
-        cmd = [str(ytdlp), "--no-update", "-o", out_tpl, "--no-overwrites",
-               "--retries", "3", "--fragment-retries", "3", *fmt, rec["url"]]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        matches = [p for p in cache_dir.glob("*.mp4") if rec["rec_id"] in p.name]
+        cmd = [sys.executable, "-m", "yt_dlp", "--no-update", "-o", out_tpl,
+               "--no-overwrites", "--no-playlist", "--retries", "3",
+               "--fragment-retries", "3", *fmt, rec["url"]]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        matches = [
+            path for path in cache_dir.glob(f"*{rec['rec_id']}*")
+            if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+        ]
         if result.returncode == 0 and matches:
             return matches[0]
     return None
 
 
-def extract_audio(video: Path) -> Path | None:
+def extract_audio(video: Path, remove_video: bool = True) -> Path | None:
     wav = video.with_suffix(".wav")
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video),
            "-vn", "-ac", "1", "-ar", "16000", str(wav)]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    video.unlink(missing_ok=True)
+    if remove_video and result.returncode == 0 and wav.exists():
+        video.unlink(missing_ok=True)
     return wav if result.returncode == 0 and wav.exists() else None
 
 
@@ -127,7 +135,7 @@ def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path):
         chunk_wav = parts_dir / "chunk.wav"
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(offset),
-             "-t", str(CHUNK_SECONDS), "-i", str(wav), "-c", "copy", str(chunk_wav)],
+             "-t", str(CHUNK_SECONDS), "-i", str(wav), "-c:a", "pcm_s16le", str(chunk_wav)],
             capture_output=True, timeout=600, check=True)
         segments, _info = model.transcribe(
             str(chunk_wav),
@@ -148,23 +156,208 @@ def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path):
     for part_json in sorted(parts_dir.glob("part*.json")):
         cues.extend(json.loads(part_json.read_text(encoding="utf-8")))
 
-    with open(dest_vtt, "w", encoding="utf-8") as f:
+    temporary_vtt = dest_vtt.with_name(dest_vtt.name + ".tmp")
+    with open(temporary_vtt, "w", encoding="utf-8") as f:
         f.write("WEBVTT\n\nNOTE\nTranscripción generada localmente con "
                 f"faster-whisper ({MODEL_SIZE}, {COMPUTE_TYPE})\n\n")
         for i, seg in enumerate(cues, 1):
             f.write(f"{i}\n{fmt_ts(seg['start'])} --> {fmt_ts(seg['end'])}\n"
                     f"{seg['text']}\n\n")
+    temporary_vtt.replace(dest_vtt)
     shutil.rmtree(parts_dir, ignore_errors=True)
+
+
+def _recording_transcripts(course_dir: Path, rec_id: str, rec_info: dict) -> list[Path]:
+    candidates = set()
+    for relative_path in rec_info.get("organized_files", []):
+        path = course_dir / relative_path
+        if path.is_file() and path.suffix.lower() == ".vtt":
+            candidates.add(path)
+    for path in course_dir.rglob("*.vtt"):
+        if rec_id in path.name:
+            candidates.add(path)
+    return [
+        path for path in candidates
+        if ".transcript." in path.name.lower() or ".cc." in path.name.lower()
+    ]
+
+
+def _has_whisper_transcript(course_dir: Path, rec_id: str, rec_info: dict) -> bool:
+    for transcript in _recording_transcripts(course_dir, rec_id, rec_info):
+        try:
+            if "generada localmente con faster-whisper" in transcript.read_text(
+                encoding="utf-8", errors="replace"
+            )[:500]:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _existing_video(course_dir: Path, rec_id: str, rec_info: dict) -> Path | None:
+    video_extensions = {".mp4", ".mkv", ".webm", ".mov"}
+    for relative_path in rec_info.get("organized_files", []):
+        candidate = course_dir / relative_path
+        if candidate.is_file() and candidate.suffix.lower() in video_extensions:
+            return candidate
+    for candidate in course_dir.rglob("*"):
+        if candidate.is_file() and rec_id in candidate.name and candidate.suffix.lower() in video_extensions:
+            return candidate
+    return None
+
+
+def _transcript_filename(title: str, rec_id: str) -> str:
+    safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title).strip(" .")
+    safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", rec_id).strip(" .")
+    return f"{safe_title or 'Clase'} [{safe_id}].whisper.transcript.vtt"
+
+
+def has_zoom_transcripts(work_dir: Path, course_slugs: list[str] | None = None) -> bool:
+    recordings_path = work_dir / "recordings.json"
+    recordings = json.loads(recordings_path.read_text(encoding="utf-8"))
+    download_dir = work_dir / "downloads"
+    for slug in course_slugs or list(recordings):
+        course = recordings.get(slug, {})
+        course_dir = download_dir / slug
+        for rec_id, rec_info in course.get("recordings", {}).items():
+            for transcript in _recording_transcripts(course_dir, rec_id, rec_info):
+                try:
+                    is_whisper = "generada localmente con faster-whisper" in transcript.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:500]
+                except OSError:
+                    continue
+                if not is_whisper:
+                    return True
+    return False
+
+
+def transcribe_all(
+    work_dir: Path,
+    course_slugs: list[str] | None = None,
+    keep_zoom_transcripts: bool = False,
+) -> tuple[int, int]:
+    """Transcribe con Whisper todas las grabaciones seleccionadas sin transcript Whisper previo."""
+    recordings_path = work_dir / "recordings.json"
+    recordings = json.loads(recordings_path.read_text(encoding="utf-8"))
+    selected_courses = course_slugs or list(recordings)
+    download_dir = work_dir / "downloads"
+    cache_dir = work_dir / ".media-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    pending = []
+    for slug in selected_courses:
+        course = recordings.get(slug)
+        if not course:
+            continue
+        course_dir = download_dir / slug
+        for rec_id, rec_info in course.get("recordings", {}).items():
+            if rec_info.get("url") and not _has_whisper_transcript(course_dir, rec_id, rec_info):
+                pending.append((slug, rec_id, rec_info))
+
+    if not pending:
+        log("Todas las grabaciones seleccionadas ya tienen transcripción de faster-whisper.")
+        return 0, 0
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as error:
+        raise RuntimeError(
+            "Falta faster-whisper. Instálalo con: pip install faster-whisper"
+        ) from error
+
+    log(f"{len(pending)} grabaciones pendientes de transcripción local.")
+    log(f"Cargando modelo {MODEL_SIZE} ({COMPUTE_TYPE}); el primer inicio descarga el modelo.")
+    model = WhisperModel(
+        MODEL_SIZE,
+        device="cpu",
+        compute_type=COMPUTE_TYPE,
+        cpu_threads=CPU_THREADS,
+    )
+    ok = failed = 0
+
+    for slug, rec_id, rec_info in pending:
+        title = rec_info.get("title", slug)
+        duration = rec_info.get("duration_minutes", 0)
+        label = f"[{slug}] {title} ({duration} min)"
+        course_dir = download_dir / slug
+        course_dir.mkdir(parents=True, exist_ok=True)
+        video = _existing_video(course_dir, rec_id, rec_info)
+        temporary_video = video is None
+        if temporary_video:
+            log(f"Descargando video para transcribir: {label}")
+            video = download_video({"url": rec_info["url"], "rec_id": rec_id}, cache_dir)
+        if not video:
+            log(f"  ERROR descargando {label}")
+            failed += 1
+            continue
+
+        wav = cache_dir / f"{slug}-{hashlib.sha256(rec_id.encode()).hexdigest()[:16]}.wav"
+        if not wav.exists():
+            log(f"  Extrayendo audio: {video.name}")
+            extracted = extract_audio(video, remove_video=temporary_video)
+            if not extracted:
+                log(f"  ERROR extrayendo audio de {label}")
+                failed += 1
+                continue
+            if extracted != wav:
+                extracted.replace(wav)
+
+        destination = course_dir / _transcript_filename(title, rec_id)
+        parts_dir = cache_dir / f"parts-{hashlib.sha256(rec_id.encode()).hexdigest()[:16]}"
+        log(f"  Transcribiendo con faster-whisper: {label}")
+        try:
+            transcribe(model, wav, destination, parts_dir)
+        except Exception as error:
+            log(f"  ERROR transcribiendo {label}: {error}; se conserva audio para reanudar")
+            failed += 1
+            continue
+        wav.unlink(missing_ok=True)
+        for previous_transcript in _recording_transcripts(course_dir, rec_id, rec_info):
+            is_whisper = "generada localmente con faster-whisper" in previous_transcript.read_text(
+                encoding="utf-8", errors="replace"
+            )[:500]
+            if previous_transcript != destination and (is_whisper or not keep_zoom_transcripts):
+                previous_transcript.unlink(missing_ok=True)
+        ok += 1
+        log(f"  OK -> {destination.name}")
+
+    log(f"Transcripción local terminada: {ok} completas, {failed} fallidas.")
+    return ok, failed
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--work-dir", default="/home/gabo/claude-udea")
+    default_work_dir = Path("C:/claude-udea") if os.name == "nt" else Path.home() / "claude-udea"
+    parser.add_argument("--work-dir", default=str(default_work_dir))
     parser.add_argument("--check", action="store_true",
                         help="solo listar grabaciones sin transcript, no procesar")
+    parser.add_argument("--always-whisper", action="store_true",
+                        help="transcribe todas las grabaciones sin un VTT local de Whisper previo")
+    parser.add_argument("--keep-zoom-transcripts", action="store_true",
+                        help="conservar la VTT original de Zoom junto con la de Whisper")
+    parser.add_argument("--course", action="append", dest="courses",
+                        help="slug del curso; se puede repetir")
     args = parser.parse_args()
 
     work_dir = Path(args.work_dir)
+    if args.always_whisper:
+        keep_zoom = args.keep_zoom_transcripts
+        if not keep_zoom and has_zoom_transcripts(work_dir, args.courses):
+            keep_zoom = input("¿Conservar también las transcripciones originales de Zoom? [S/n]: ").strip().lower() not in {"n", "no"}
+        ok, failed = transcribe_all(work_dir, args.courses, keep_zoom)
+        if ok:
+            recordings_path = work_dir / "recordings.json"
+            recordings = json.loads(recordings_path.read_text(encoding="utf-8"))
+            download_dir = work_dir / "downloads"
+            from claude_udea.download import rename_downloads
+            rename_downloads(download_dir, recordings)
+            copy_transcripts(download_dir, recordings)
+            recordings_path.write_text(
+                json.dumps(recordings, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        sys.exit(1 if failed else 0)
     recordings, missing = find_missing(work_dir)
 
     if not missing:

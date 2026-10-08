@@ -23,6 +23,7 @@
 2. **Descarga y organiza** videos y transcripciones con metadata e índice por asignatura
 3. **Abre** Claude Code, Gemini CLI u Ollama, o funciona sin asistente
 4. **Genera transcripciones locales** con faster-whisper cuando Zoom no ofrece subtítulos
+5. **Sincroniza materiales Moodle e Ingenia** como archivos, carpetas, páginas y adjuntos docentes cuando la cuenta tiene acceso
 
 Todo en un solo comando: `claude_udea`
 
@@ -32,6 +33,8 @@ Todo en un solo comando: `claude_udea`
 
 - **Sin navegador** -- login y scraping por HTTP directo, no necesita GUI ni Chromium
 - **Moodle e Ingenia** -- obtiene fechas, duración y enlaces de las grabaciones
+- **Materiales Moodle** -- recorre las secciones enlazadas del curso y sincroniza documentos y páginas en una carpeta separada
+- **Materiales Ingenia** -- inicia sesión en el campus y recorre cursos autorizados
 - **Pipeline paralelo** -- scrapea materias y descarga grabaciones simultaneamente
 - **Setup interactivo** -- la primera vez te guia para configurar tus asignaturas
 - **Asistentes flexibles** -- Claude Code, Gemini CLI, chat local con Ollama o modo sin asistente
@@ -53,7 +56,7 @@ Todo en un solo comando: `claude_udea`
 | **Node.js >= 18** | Instalar Claude Code o Gemini CLI automáticamente | [nodejs.org](https://nodejs.org/) (LTS) |
 | **Git** | Clonar el repositorio | [git-scm.com](https://git-scm.com/) |
 
-Las dependencias de Python se instalan automáticamente al ejecutar la herramienta. Node.js solo es necesario para Claude Code o Gemini CLI. Ollama es opcional y se instala por separado.
+Las dependencias de Python, incluido `keyring` para el almacén seguro del sistema, se instalan automáticamente. Node.js solo es necesario para Claude Code o Gemini CLI. Ollama es opcional y se instala por separado.
 
 Para ejecutar `transcribe_missing.py` se requieren además `faster-whisper`, FFmpeg y ffprobe. ffprobe también mejora la asociación de algunas descargas antiguas de Ingenia.
 
@@ -148,6 +151,14 @@ claude_udea              # Actualiza todo y abre el asistente configurado
 
 Si la sesión de Moodle sigue activa, no vuelve a pedir credenciales. Ingenia no utiliza esa sesión.
 
+Las ejecuciones normales también sincronizan materiales de las asignaturas Moodle. Para descargar solo documentos, sin ejecutar el pipeline de grabaciones ni abrir un asistente:
+
+```bash
+claude_udea --sync-materials
+```
+
+También puedes limitarlo a una asignatura, por ejemplo `claude_udea --sync-materials arquitectura-de-software`.
+
 ### Claude Code y Gemini CLI
 
 Edita `~/claude-udea/config.json` (o `C:\claude-udea\config.json` en Windows) y cambia `"assistant"`:
@@ -174,6 +185,14 @@ Puedes elegir otro modelo con `--ollama-model` o con `CLAUDE_UDEA_OLLAMA_MODEL`.
 El chat incluye `/listado`, `/leer ruta.vtt`, `/buscar texto`, `/pendientes`, `/ensenar tema`, `/help` y `/salir`.
 Ollama se conecta a `OLLAMA_HOST` o, por defecto, a `http://127.0.0.1:11434`.
 
+### Preferir transcripciones de faster-whisper
+
+```bash
+claude_udea --always-whisper --skip-video
+```
+
+Descarga temporalmente los videos que hagan falta y genera una VTT local. Si Zoom también proporciona subtítulos, el programa pregunta si quieres conservar ambas versiones. Whisper queda en `transcripts/whisper/` y los originales en `transcripts/zoom/`. La opción se aplica a las asignaturas seleccionadas; puedes indicar slugs para limitarla. Los resultados ya generados por faster-whisper se conservan y no se vuelven a procesar en cada ejecución. Requiere `faster-whisper`, FFmpeg y ffprobe.
+
 ### Ejecutar sin asistente
 
 ```bash
@@ -195,7 +214,15 @@ claude_udea --no-assistant    # No abrir un asistente de IA
 claude_udea --ollama          # Abrir chat local con Ollama
 claude_udea --ollama --ollama-model mistral  # Elegir modelo local
 claude_udea --no-claude       # Alias compatible de --no-assistant
+claude_udea --sync-materials  # Solo materiales Moodle; no descarga grabaciones
+claude_udea --skip-materials  # Omitir materiales en el flujo normal
+claude_udea --sync-ingenia-materials "https://ingenia.udea.edu.co/campus/course/view.php?id=215"
+claude_udea --always-whisper --skip-video # Crear VTT con faster-whisper
 ```
+
+En cada carpeta `downloads/<curso>/` los archivos se separan en `videos/`, `transcripts/zoom/`, `transcripts/whisper/` y `chat/`. Los archivos de chat se organizan allí si la descarga/plataforma los proporciona; Zoom no siempre expone un archivo de chat descargable.
+
+El comando de Ingenia solicita usuario y contraseña directamente en la terminal si no existe una sesión válida. Los datos se guardan separados de Moodle en Windows Credential Manager. La cuenta debe estar matriculada en el curso; el scraper no intenta comprar ni matricularse.
 
 ### Filtrar por asignatura
 
@@ -246,8 +273,11 @@ C:\claude-udea\                   # Windows
 |-- CLAUDE.md                     # Instrucciones para Claude Code (auto-generado)
 |-- config.json                   # Tus asignaturas configuradas
 |-- recordings.json               # Registro de grabaciones encontradas
-|-- .moodle-session.json          # Sesion de Moodle (cookies)
-|-- .moodle-credentials.json     # Credenciales para re-login automatico
+|-- course-materials/             # Documentos y páginas de Moodle
+|   |-- arquitectura-de-software/
+|   |   |-- manifest.json         # Origen, tamaño, hash y estado de archivos
+|   |   +-- files/                 # Documentos descargados
+|   +-- ...
 |-- .claude/
 |   |-- rules.md                  # Reglas del asistente
 |   +-- skills/                   # Comandos disponibles
@@ -270,7 +300,7 @@ C:\claude-udea\                   # Windows
             +-- ...
 ```
 
-  Los nombres incluyen el número de clase y la fecha. Arquitectura de Software y Fábrica Escuela mantienen numeraciones secuenciales independientes. Fábrica Escuela lleva el prefijo `Fabrica Escuela -`, por ejemplo `Fabrica Escuela - Clase #1 - 2026-08-19.mp4`. Al ejecutar de nuevo, se renumeran en orden cronológico si aparecen grabaciones anteriores. `downloads/transcripts/index.json` contiene metadata organizada por asignatura.
+Las credenciales y cookies no se guardan como archivos en claro: se almacenan en el almacén seguro del sistema operativo. Los nombres de grabaciones incluyen número y fecha; Arquitectura de Software y Fábrica Escuela mantienen secuencias independientes. `downloads/transcripts/index.json` contiene metadata por asignatura.
 
   ## Transcribir grabaciones sin subtítulos
 
@@ -284,6 +314,12 @@ C:\claude-udea\                   # Windows
   ```
 
   Quita `--check` para transcribir. El script actual está orientado a Linux: usa `.venv/bin/yt-dlp` y su directorio de trabajo predeterminado es `/home/gabo/claude-udea`. En otros entornos se deben adaptar esas rutas antes de ejecutarlo.
+
+  ## Materiales Moodle
+
+  Los materiales quedan en `course-materials/<curso>/`, fuera de `downloads/`, para que el organizador de videos y transcripciones no los renombre. El scraper sigue las secciones `section=...` enlazadas por Moodle y recoge archivos directos, carpetas, recursos, el texto y adjuntos de actividades Página, y adjuntos de instrucciones docentes de tareas. Las entregas de estudiantes se excluyen. Las actividades `URL` externas se registran en `manifest.json`, pero no se descargan desde dominios externos.
+
+  La sincronización de materiales soporta Moodle e Ingenia. La ruta Ingenia `/campus/course/view.php` puede llevar a la página de matrícula/compra en vez del aula; para sincronizar materiales se requiere una cuenta autorizada y matrícula activa. El acceso usa credenciales independientes de Moodle UdeArroba.
 
 ---
 
@@ -300,17 +336,19 @@ C:\claude-udea\                   # Windows
 ```
 
 1. **Login**: POST directo con usuario y contraseña, sin navegador. La sesión y las credenciales para re-login se guardan localmente.
-2. **Scraping**: Moodle se lee desde su tabla de grabaciones; Ingenia se lee desde el payload de datos de su pagina, que incluye todas las grabaciones aunque la interfaz las pagine. Se conservan solo los enlaces de video y se guarda su fecha/hora original.
+2. **Scraping**: Moodle e Ingenia se recorren por sus secciones autenticadas para encontrar documentos, páginas y carpetas. Las listas de grabaciones Zoom se siguen obteniendo desde las páginas de cada plataforma.
 3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) y, si se solicita, videos. El pipeline descarga en paralelo y añade metadata a los VTT.
 4. **Organización**: se asigna numeración secuencial independiente a Arquitectura de Software y Fábrica Escuela, y se regenera el índice por asignatura.
 5. **Asistente**: Claude Code y Gemini CLI usan las instrucciones generadas. Ollama ofrece un chat local con acceso al índice y a los VTT que se carguen con `/leer`.
+6. **Material Moodle**: los archivos se descargan en `course-materials/` con manifiestos de origen, tamaño y hash. Las entregas de estudiantes no se recopilan.
 
 ---
 
 ## Privacidad y seguridad
 
-- Las cookies se guardan localmente en `.moodle-session.json` y las credenciales para re-login en `.moodle-credentials.json`.
-- El archivo de credenciales contiene usuario y contraseña sin cifrar. Se intenta restringir sus permisos en sistemas compatibles; protege la carpeta de trabajo y no compartas ese archivo.
+- Las cookies y credenciales Moodle e Ingenia se guardan por separado en el almacén seguro del sistema operativo (`Windows Credential Manager` en Windows). No se mantienen en JSON en claro.
+- Al migrar una instalación previa, los JSON legados solo se eliminan después de verificar que su contenido quedó guardado en el almacén seguro.
+- Si el sistema no ofrece un backend de keyring seguro, el programa falla de forma cerrada y no vuelve a guardar secretos sin cifrar.
 - Las descargas y transcripciones se guardan localmente. El scraping consulta Moodle, Ingenia y Zoom.
 - Ollama se conecta al servidor configurado en `OLLAMA_HOST` (local por defecto). Claude Code y Gemini CLI son servicios de terceros; revisa sus políticas antes de enviar contenido de clase.
 

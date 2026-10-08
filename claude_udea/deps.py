@@ -13,6 +13,7 @@ DEPS = {
     "bs4": {"pip": "beautifulsoup4", "desc": "Parser HTML para scraping de grabaciones"},
     "questionary": {"pip": "questionary", "desc": "Menus interactivos en terminal"},
     "tqdm": {"pip": "tqdm", "desc": "Barras de progreso"},
+    "keyring": {"pip": "keyring>=25.0", "desc": "Almacén seguro del sistema para credenciales y sesiones"},
 }
 
 ASSISTANTS = {
@@ -134,7 +135,7 @@ def _choose_assistant() -> str:
         return "claude" if resp == "2" else "gemini"
 
 
-def check_and_install(auto=False, skip_assistant=False):
+def check_and_install(auto=False, skip_assistant=False, require_whisper=False):
     """
     Verifica dependencias. Si falta algo, pregunta si instalar.
     Retorna True si todo esta listo.
@@ -144,6 +145,11 @@ def check_and_install(auto=False, skip_assistant=False):
     for module, info in DEPS.items():
         if not _try_import(module):
             missing.append(info)
+    if require_whisper and not _try_import("faster_whisper"):
+        missing.append({
+            "pip": "faster-whisper>=1.2.0",
+            "desc": "Transcripción local de video con Whisper",
+        })
 
     assistant_info = None
     assistant_ok = True

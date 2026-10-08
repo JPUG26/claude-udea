@@ -8,6 +8,7 @@ import getpass
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,6 +17,9 @@ from bs4 import BeautifulSoup
 
 SESSION_FILE = ".moodle-session.json"
 CREDENTIALS_FILE = ".moodle-credentials.json"
+KEYRING_SERVICE = "claude-udea"
+SESSION_ACCOUNT = "moodle-session"
+CREDENTIALS_ACCOUNT = "moodle-credentials"
 LOGIN_URL = "https://udearroba.udea.edu.co/internos/login/index.php"
 DASHBOARD_URL = "https://udearroba.udea.edu.co/internos/my/"
 
@@ -28,8 +32,36 @@ def _credentials_path(work_dir: Path) -> Path:
     return work_dir / CREDENTIALS_FILE
 
 
+def _keyring_backend():
+    try:
+        import keyring
+        backend = keyring.get_keyring()
+    except Exception as error:
+        raise RuntimeError(
+            "No se pudo acceder al almacén seguro del sistema. "
+            "Las credenciales no se guardarán en archivos sin cifrar."
+        ) from error
+    if getattr(backend, "priority", 0) <= 0:
+        raise RuntimeError(
+            "No hay un almacén de credenciales seguro disponible. "
+            "Las credenciales no se guardarán en archivos sin cifrar."
+        )
+    return keyring
+
+
+def _get_secret(account: str) -> str | None:
+    return _keyring_backend().get_password(KEYRING_SERVICE, account)
+
+
+def _set_secret(account: str, value: str):
+    keyring = _keyring_backend()
+    keyring.set_password(KEYRING_SERVICE, account, value)
+    if keyring.get_password(KEYRING_SERVICE, account) != value:
+        raise RuntimeError("El almacén seguro no confirmó la escritura del secreto.")
+
+
 def save_session(session: requests.Session, work_dir: Path):
-    """Guarda cookies de la sesión a disco."""
+    """Guarda cookies en el almacén seguro del sistema operativo."""
     data = []
     for cookie in session.cookies:
         data.append({
@@ -38,45 +70,77 @@ def save_session(session: requests.Session, work_dir: Path):
             "domain": cookie.domain,
             "path": cookie.path,
         })
-    with open(_session_path(work_dir), "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    _set_secret(SESSION_ACCOUNT, json.dumps(data))
+    _session_path(work_dir).unlink(missing_ok=True)
 
 
 def _save_credentials(work_dir: Path, username: str, password: str):
-    """Guarda credenciales para re-login automático."""
-    path = _credentials_path(work_dir)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump({"username": username, "password": password}, f)
-    # Restringir permisos (solo el usuario puede leer)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    """Guarda credenciales cifradas por el almacén del sistema operativo."""
+    _set_secret(
+        CREDENTIALS_ACCOUNT,
+        json.dumps({"username": username, "password": password}),
+    )
+    _credentials_path(work_dir).unlink(missing_ok=True)
 
 
 def _load_credentials(work_dir: Path) -> tuple[str, str] | None:
     """Carga credenciales guardadas."""
-    path = _credentials_path(work_dir)
-    if not path.exists():
-        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        stored = _get_secret(CREDENTIALS_ACCOUNT)
+        path = _credentials_path(work_dir)
+        if stored is not None:
+            data = json.loads(stored)
+        elif path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            return None
         return data.get("username", ""), data.get("password", "")
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return None
+
+
+def migrate_saved_secrets(work_dir: Path) -> list[str]:
+    """Migra archivos JSON legados al almacén seguro y los elimina tras verificarlos."""
+    migrated = []
+    legacy_secrets = (
+        (_session_path(work_dir), SESSION_ACCOUNT),
+        (_credentials_path(work_dir), CREDENTIALS_ACCOUNT),
+    )
+    for path, account in legacy_secrets:
+        if not path.exists():
+            continue
+        legacy_value = path.read_text(encoding="utf-8")
+        stored = _get_secret(account)
+        if stored is None:
+            _set_secret(account, legacy_value)
+            stored = _get_secret(account)
+        if stored != legacy_value:
+            raise RuntimeError(
+                f"No se pudo verificar la migración segura de {path.name}; "
+                "el archivo original se conservó."
+            )
+        path.unlink()
+        migrated.append(path.name)
+    return migrated
 
 
 def load_session(work_dir: Path) -> requests.Session | None:
     """Carga sesión guardada y verifica que siga activa."""
     path = _session_path(work_dir)
-    if not path.exists():
+    stored = _get_secret(SESSION_ACCOUNT)
+    if stored is None and not path.exists():
         return None
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-    except Exception:
+        if stored is not None:
+            cookies = json.loads(stored)
+        elif path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+        else:
+            return None
+    except (OSError, ValueError, TypeError):
         return None
 
     session = requests.Session()
@@ -192,12 +256,11 @@ def _ingenia_recordings_from_html(html: str) -> list[dict]:
         payload = push_data[1]
         if not isinstance(payload, str):
             continue
-        marker = '"recordings":['
-        marker_index = payload.find(marker)
-        if marker_index < 0:
+        marker = re.search(r'"recordings"\s*:\s*\[', payload)
+        if not marker:
             continue
 
-        array_start = payload.find("[", marker_index)
+        array_start = payload.find("[", marker.start())
         try:
             recordings, _ = decoder.raw_decode(payload, array_start)
         except (json.JSONDecodeError, TypeError):
@@ -211,16 +274,32 @@ def _ingenia_recordings_from_html(html: str) -> list[dict]:
 def _scrape_ingenia(session: requests.Session, slug: str,
                     course_info: dict) -> tuple[str, list[dict]]:
     """Extrae todas las grabaciones de una página de Virtual Ingeniería."""
-    try:
-        response = session.get(course_info["moodle_url"], timeout=30)
-        response.raise_for_status()
-    except Exception as error:
-        print(f"  ⚠ Error accediendo a {course_info['name']} en Ingenia: {error}")
-        return slug, []
+    last_error = None
+    recordings = []
+    for attempt in range(3):
+        try:
+            response = session.get(
+                course_info["moodle_url"],
+                headers={"Cache-Control": "no-cache"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            if "login" in urlparse(response.url).path.lower():
+                raise PermissionError("Ingenia redirigió a una página de acceso.")
+            recordings = _ingenia_recordings_from_html(response.text)
+            if recordings:
+                break
+            last_error = "la respuesta no contenía el bloque de grabaciones de Next.js"
+        except Exception as error:
+            last_error = str(error)
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
 
-    recordings = _ingenia_recordings_from_html(response.text)
     if not recordings:
-        print(f"  ⚠ No se encontró metadata de grabaciones en {course_info['name']} (Ingenia)")
+        print(
+            f"  ⚠ No se encontró metadata de grabaciones en {course_info['name']} "
+            f"(Ingenia) después de 3 intentos: {last_error}"
+        )
         return slug, []
 
     links = []
