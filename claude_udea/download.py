@@ -184,10 +184,18 @@ def _class_number_from_filename(filename: str):
     return int(match.group(1)) if match else None
 
 
-def _class_filename(meta: dict, date_str: str) -> str:
-    normalized_title = unicodedata.normalize("NFKD", meta.get("title", ""))
+def _class_category(title: str) -> str:
+    normalized_title = unicodedata.normalize("NFKD", title)
     normalized_title = normalized_title.encode("ascii", "ignore").decode("ascii").lower()
-    category = "Fabrica Escuela - " if "fabrica de escuela" in normalized_title else ""
+    return "fabrica_escuela" if "fabrica de escuela" in normalized_title else "course"
+
+
+def _class_category_from_filename(filename: str) -> str:
+    return "fabrica_escuela" if filename.lower().startswith("fabrica escuela - ") else "course"
+
+
+def _class_filename(meta: dict, date_str: str) -> str:
+    category = "Fabrica Escuela - " if meta.get("class_category") == "fabrica_escuela" else ""
     return f"{category}Clase #{meta['class_number']} - {date_str}"
 
 
@@ -198,23 +206,26 @@ def _build_rec_id_map(recordings: dict) -> dict:
         ordered_recordings = sorted(
             course.get("recordings", {}).items(), key=_recording_sort_key
         )
-        class_number = 0
+        class_numbers = {}
         class_by_datetime = {}
         for rec_id, rec_info in ordered_recordings:
+            category = _class_category(rec_info.get("title", ""))
             date_key = _datetime_key(rec_info.get("start_date", ""))
-            if date_key is not None and date_key in class_by_datetime:
-                recording_class = class_by_datetime[date_key]
+            category_date_key = (category, date_key)
+            if date_key is not None and category_date_key in class_by_datetime:
+                recording_class = class_by_datetime[category_date_key]
             else:
-                class_number += 1
-                recording_class = class_number
+                class_numbers[category] = class_numbers.get(category, 0) + 1
+                recording_class = class_numbers[category]
                 if date_key is not None:
-                    class_by_datetime[date_key] = recording_class
+                    class_by_datetime[category_date_key] = recording_class
             id_map[rec_id] = {
                 "slug": slug,
                 "course_name": course.get("name", slug),
                 "start_date": rec_info.get("start_date", ""),
                 "duration_minutes": rec_info.get("duration_minutes", 0),
                 "title": rec_info.get("title", ""),
+                "class_category": category,
                 "class_number": recording_class,
             }
     return id_map
@@ -261,7 +272,7 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
 
     id_map = _build_rec_id_map(recordings)
     class_map = {
-        (meta["slug"], meta["class_number"]): meta
+        (meta["slug"], meta["class_category"], meta["class_number"]): meta
         for meta in id_map.values()
     }
     count = 0
@@ -282,7 +293,8 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
         if not rec_id:
             class_number = _class_number_from_filename(vtt_file.name)
             if class_number:
-                meta = class_map.get((course_slug, class_number), {})
+                category = _class_category_from_filename(vtt_file.name)
+                meta = class_map.get((course_slug, category, class_number), {})
         if rec_id and not meta:
             return
 

@@ -1,69 +1,73 @@
 <p align="center">
   <h1 align="center">claude_udea</h1>
   <p align="center">
-    <strong>Tu asistente academico con IA para la Universidad de Antioquia</strong>
+    <strong>Transcripciones y asistente académico para la Universidad de Antioquia</strong>
   </p>
   <p align="center">
-    Descarga automatica de grabaciones de Zoom desde Moodle e Ingenia -> Analisis con IA
+    Descarga y organiza grabaciones de Zoom desde Moodle e Ingenia; consulta las clases con IA
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/python-≥3.10-blue?style=flat-square&logo=python&logoColor=white" alt="Python">
-    <img src="https://img.shields.io/badge/Claude_Code-CLI-orange?style=flat-square&logo=anthropic&logoColor=white" alt="Claude Code">
+    <img src="https://img.shields.io/badge/IA-Claude%20%7C%20Gemini%20%7C%20Ollama-orange?style=flat-square" alt="Claude, Gemini y Ollama">
     <img src="https://img.shields.io/badge/plataforma-Windows_|_macOS_|_Linux-green?style=flat-square" alt="Cross-platform">
   </p>
 </p>
 
 ---
 
-## Que es?
+## Qué es
 
 `claude_udea` es una herramienta de linea de comandos que:
 
-1. **Scrapea** las grabaciones de Zoom desde Moodle (UdeArroba) y Virtual Ingenieria (Ingenia)
-2. **Descarga** las transcripciones (y opcionalmente los videos)
-3. **Abre Claude Code** como asistente academico personalizado con tus clases
+1. **Busca** grabaciones de Zoom en Moodle (UdeArroba) e Ingenia (Virtual Ingeniería)
+2. **Descarga y organiza** videos y transcripciones con metadata e índice por asignatura
+3. **Abre** Claude Code, Gemini CLI u Ollama, o funciona sin asistente
+4. **Genera transcripciones locales** con faster-whisper cuando Zoom no ofrece subtítulos
 
 Todo en un solo comando: `claude_udea`
 
 ---
 
-## Caracteristicas
+## Características
 
 - **Sin navegador** -- login y scraping por HTTP directo, no necesita GUI ni Chromium
-- **Moodle e Ingenia** -- obtiene fechas, duracion y enlace de video de cada plataforma
+- **Moodle e Ingenia** -- obtiene fechas, duración y enlaces de las grabaciones
 - **Pipeline paralelo** -- scrapea materias y descarga grabaciones simultaneamente
 - **Setup interactivo** -- la primera vez te guia para configurar tus asignaturas
-- **Instalacion automatica** -- detecta e instala dependencias faltantes (incluido Claude Code)
-- **Sesion persistente** -- guarda tu sesion de Moodle para no pedir login cada vez
+- **Asistentes flexibles** -- Claude Code, Gemini CLI, chat local con Ollama o modo sin asistente
+- **Sesión persistente** -- restaura la sesión de Moodle y puede volver a iniciar sesión automáticamente
 - **Descarga incremental** -- nunca re-descarga lo que ya tenes
 - **Deduplicacion inteligente** -- identifica grabaciones por fecha, sin duplicados
+- **Numeración independiente** -- Arquitectura de Software y Fábrica Escuela tienen secuencias separadas
+- **Transcripción local opcional** -- faster-whisper procesa grabaciones sin subtítulos de Zoom
 - **Cross-platform** -- funciona en Windows, macOS y Linux (incluido Raspberry Pi headless)
 - **Skills de Claude** -- comandos especializados para estudiar con IA
 
 ---
 
-## Requisitos previos
+## Requisitos
 
 | Requisito | Para que | Como instalar |
 |-----------|----------|---------------|
 | **Python >= 3.10** | Ejecutar la herramienta | [python.org](https://www.python.org/downloads/) |
-| **Node.js >= 18** | Instalar el asistente AI | [nodejs.org](https://nodejs.org/) (LTS) |
+| **Node.js >= 18** | Instalar Claude Code o Gemini CLI automáticamente | [nodejs.org](https://nodejs.org/) (LTS) |
 | **Git** | Clonar el repositorio | [git-scm.com](https://git-scm.com/) |
 
-> Las demas dependencias (yt-dlp, requests, etc.) se instalan automaticamente.
+Las dependencias de Python se instalan automáticamente al ejecutar la herramienta. Node.js solo es necesario para Claude Code o Gemini CLI. Ollama es opcional y se instala por separado.
 
-> Para asociar descargas antiguas de Ingenia con las fechas recuperadas, se recomienda tener `ffprobe` (incluido en FFmpeg) en el `PATH`. Es opcional para nuevas descargas.
+Para ejecutar `transcribe_missing.py` se requieren además `faster-whisper`, FFmpeg y ffprobe. ffprobe también mejora la asociación de algunas descargas antiguas de Ingenia.
 
 ### Asistente AI
 
-La primera vez que ejecutes `claude_udea`, te preguntara que asistente queres usar:
+La primera vez que ejecutes `claude_udea`, puedes elegir Claude Code o Gemini CLI. Ollama se inicia con `--ollama`; `--no-assistant` ejecuta solo el pipeline de descargas.
 
 | Asistente | Costo | Limite |
 |-----------|-------|--------|
 | **Gemini CLI** (Google) | Gratis | 1000 requests/dia con cuenta Google |
 | **Claude Code** (Anthropic) | $20/mes (Pro) | Mejor calidad de respuestas |
+| **Ollama** (local) | Gratis | Requiere instalar Ollama y descargar un modelo |
 
-Podes cambiar de asistente despues editando `assistant` en `~/claude-udea/config.json`.
+La selección de Claude o Gemini se guarda en `config.json`. Ollama es una opción por ejecución y no cambia esa preferencia.
 
 ---
 
@@ -72,13 +76,13 @@ Podes cambiar de asistente despues editando `assistant` en `~/claude-udea/config
 ### Opcion 1: Desde GitHub (recomendado)
 
 ```bash
-pip install git+https://github.com/gjcardonam/claude-udea.git
+pip install git+https://github.com/JPUG26/claude-udea.git
 ```
 
 ### Opcion 2: Clonar y desarrollo local
 
 ```bash
-git clone https://github.com/gjcardonam/claude-udea.git
+git clone https://github.com/JPUG26/claude-udea.git
 cd claude-udea
 pip install -e .
 ```
@@ -91,7 +95,7 @@ Si ves el error `externally-managed-environment`, usa un entorno virtual:
 python3 -m venv .venv
 source .venv/bin/activate   # Linux/macOS
 # .venv\Scripts\activate    # Windows
-pip install git+https://github.com/gjcardonam/claude-udea.git
+pip install git+https://github.com/JPUG26/claude-udea.git
 ```
 
 Para que el comando `claude_udea` este disponible globalmente, crea un symlink:
@@ -110,16 +114,16 @@ echo $PATH | grep -q '.local/bin' && echo "OK" || echo "Agrega ~/.local/bin a tu
 
 ### Primera vez
 
-> **Antes de empezar**: tene listos los links de la pagina de grabaciones de cada asignatura en Moodle.
-> Es la pagina donde ves la lista de grabaciones de Zoom con los botones "Ver grabacion".
-> Solo se piden **una vez** durante la configuracion inicial.
+> **Antes de empezar**: tené listas las URLs de grabaciones de cada asignatura en Moodle o Ingenia. El setup pregunta la plataforma para cada materia.
 
-#### Como conseguir el link?
+#### Cómo conseguir el link de Moodle?
 
 1. Entra a [UdeArroba](https://udearroba.udea.edu.co/)
 2. Abri la asignatura
 3. Busca la actividad de **Zoom** donde estan las grabaciones
 4. Copia la URL de esa pagina -- es algo como `https://udearroba.udea.edu.co/mod/zoom/view.php?id=XXXXX`
+
+Para Ingenia, copia la URL `https://ingenia.udea.edu.co/zoom/meeting/<ID>` o pega solo el número de reunión. No requiere inicio de sesión de Moodle.
 
 #### Ejecutar
 
@@ -130,21 +134,21 @@ claude_udea
 Se va a:
 
 1. Verificar e instalar dependencias faltantes
-2. Preguntar que asistente AI queres (Gemini gratis o Claude de pago)
-3. Pedir los links de grabaciones de cada asignatura (solo la primera vez)
-4. Pedir usuario y contrasena de Moodle en la terminal (sin navegador)
+2. Preguntar qué asistente querés usar (Gemini o Claude; Ollama se activa con `--ollama`)
+3. Pedir plataforma y link de cada asignatura (solo la primera vez)
+4. Pedir credenciales Moodle solo si hay materias de Moodle
 5. Scrapear y descargar todo en paralelo
-6. Abrir el asistente AI con tus transcripciones
+6. Abrir el asistente elegido, salvo que uses `--no-assistant`
 
 ### Ejecuciones siguientes
 
 ```bash
-claude_udea              # Actualiza todo y abre Claude Code
+claude_udea              # Actualiza todo y abre el asistente configurado
 ```
 
-Si tu sesion de Moodle sigue activa, no pide credenciales -- todo corre automaticamente.
+Si la sesión de Moodle sigue activa, no vuelve a pedir credenciales. Ingenia no utiliza esa sesión.
 
-### Cambiar de asistente
+### Claude Code y Gemini CLI
 
 Edita `~/claude-udea/config.json` (o `C:\claude-udea\config.json` en Windows) y cambia `"assistant"`:
 
@@ -155,7 +159,28 @@ Edita `~/claude-udea/config.json` (o `C:\claude-udea\config.json` en Windows) y 
 }
 ```
 
-Valores: `"claude"` o `"gemini"`.
+Valores: `"claude"` o `"gemini"`. Para cambiar la preferencia, edita el valor en `config.json`.
+
+### Asistente local con Ollama
+
+Instala [Ollama](https://ollama.com/) y descarga un modelo:
+
+```bash
+ollama pull llama3.2
+claude_udea --ollama --skip-video
+```
+
+Puedes elegir otro modelo con `--ollama-model` o con `CLAUDE_UDEA_OLLAMA_MODEL`.
+El chat incluye `/listado`, `/leer ruta.vtt`, `/buscar texto`, `/pendientes`, `/ensenar tema`, `/help` y `/salir`.
+Ollama se conecta a `OLLAMA_HOST` o, por defecto, a `http://127.0.0.1:11434`.
+
+### Ejecutar sin asistente
+
+```bash
+claude_udea --no-assistant
+```
+
+Descarga y organiza las transcripciones sin exigir ni abrir Claude Code, Gemini CLI u Ollama. `--no-claude` se mantiene como alias compatible.
 
 ### Opciones
 
@@ -166,6 +191,10 @@ claude_udea --skip-video      # Solo transcripciones (sin preguntar)
 claude_udea --all             # Video + transcripciones (sin preguntar)
 claude_udea --dry-run         # Simular sin descargar nada
 claude_udea --add-course      # Agregar una nueva asignatura
+claude_udea --no-assistant    # No abrir un asistente de IA
+claude_udea --ollama          # Abrir chat local con Ollama
+claude_udea --ollama --ollama-model mistral  # Elegir modelo local
+claude_udea --no-claude       # Alias compatible de --no-assistant
 ```
 
 ### Filtrar por asignatura
@@ -209,7 +238,7 @@ Compromisos encontrados:
 
 ---
 
-## Estructura de archivos
+## Archivos y nombres
 
 ```
 ~/claude-udea/                    # macOS/Linux
@@ -218,6 +247,7 @@ C:\claude-udea\                   # Windows
 |-- config.json                   # Tus asignaturas configuradas
 |-- recordings.json               # Registro de grabaciones encontradas
 |-- .moodle-session.json          # Sesion de Moodle (cookies)
+|-- .moodle-credentials.json     # Credenciales para re-login automatico
 |-- .claude/
 |   |-- rules.md                  # Reglas del asistente
 |   +-- skills/                   # Comandos disponibles
@@ -240,7 +270,20 @@ C:\claude-udea\                   # Windows
             +-- ...
 ```
 
-      Los videos y transcripciones se nombran por asignatura y en orden cronologico, por ejemplo `Clase #1 - 2026-03-09.mp4` y `Clase #1 - 2026-03-09.transcript.vtt`. Las sesiones de Fábrica Escuela agregan el prefijo `Fabrica Escuela -` para distinguirlas, por ejemplo `Fabrica Escuela - Clase #5 - 2026-08-19.mp4`. Al ejecutar de nuevo, los archivos se renumeran si aparece una grabacion anterior.
+  Los nombres incluyen el número de clase y la fecha. Arquitectura de Software y Fábrica Escuela mantienen numeraciones secuenciales independientes. Fábrica Escuela lleva el prefijo `Fabrica Escuela -`, por ejemplo `Fabrica Escuela - Clase #1 - 2026-08-19.mp4`. Al ejecutar de nuevo, se renumeran en orden cronológico si aparecen grabaciones anteriores. `downloads/transcripts/index.json` contiene metadata organizada por asignatura.
+
+  ## Transcribir grabaciones sin subtítulos
+
+  `transcribe_missing.py` genera transcripciones locales con faster-whisper para grabaciones que no tienen `.transcript.vtt` ni `.cc.vtt`. Procesa el audio por bloques, permite reanudar una ejecución interrumpida y actualiza `downloads/transcripts/` y su índice.
+
+  Instala faster-whisper y FFmpeg (incluido ffprobe), y lista las grabaciones pendientes:
+
+  ```bash
+  pip install faster-whisper
+  python transcribe_missing.py --work-dir /ruta/a/claude-udea --check
+  ```
+
+  Quita `--check` para transcribir. El script actual está orientado a Linux: usa `.venv/bin/yt-dlp` y su directorio de trabajo predeterminado es `/home/gabo/claude-udea`. En otros entornos se deben adaptar esas rutas antes de ejecutarlo.
 
 ---
 
@@ -248,28 +291,28 @@ C:\claude-udea\                   # Windows
 
 ```
 +-----------+     +-----------+     +-----------+     +----------------+
-|  Moodle   |---->| Scraping  |---->| Descarga  |---->| Claude / Gemini|
-| (UdeArroba)|    | (requests)|     | (yt-dlp)  |     |  (Asistente)   |
-+-----------+     +-----------+     +-----------+     +----------------+
-     |                 |                  |                  |
-  Login HTTP      Busca links        Baja VTTs        Lee transcripciones
-  (una vez)      en paralelo       en paralelo        y responde preguntas
+| Moodle /  |---->| Scraping  |---->| Descarga  |---->| Claude/Gemini/ |
+| Ingenia   |     | (requests)|     | (yt-dlp)  |     | Ollama o solo |
++-----------+     +-----------+     +-----------+     | transcripciones|
+  |                 |                  |           +----------------+
+ Login Moodle    Busca links       Videos y VTTs       Chat opcional
+ si aplica       en paralelo       en paralelo         o modo sin IA
 ```
 
-1. **Login**: POST directo con usuario/contrasena, sin navegador. La sesion se guarda localmente.
+1. **Login**: POST directo con usuario y contraseña, sin navegador. La sesión y las credenciales para re-login se guardan localmente.
 2. **Scraping**: Moodle se lee desde su tabla de grabaciones; Ingenia se lee desde el payload de datos de su pagina, que incluye todas las grabaciones aunque la interfaz las pagine. Se conservan solo los enlaces de video y se guarda su fecha/hora original.
-3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) en paralelo. Las descargas empiezan a medida que cada scrape termina (pipeline). Cada VTT se enriquece con metadata (fecha, asignatura, duracion).
-4. **Asistente AI**: Se abre Claude Code o Gemini CLI (segun tu eleccion) con instrucciones personalizadas (`CLAUDE.md` / `GEMINI.md`) que le dicen que asignaturas tenes, donde estan las transcripciones, y como responder.
+3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) y, si se solicita, videos. El pipeline descarga en paralelo y añade metadata a los VTT.
+4. **Organización**: se asigna numeración secuencial independiente a Arquitectura de Software y Fábrica Escuela, y se regenera el índice por asignatura.
+5. **Asistente**: Claude Code y Gemini CLI usan las instrucciones generadas. Ollama ofrece un chat local con acceso al índice y a los VTT que se carguen con `/leer`.
 
 ---
 
 ## Privacidad y seguridad
 
-- Tus credenciales se piden por terminal y **solo se usan para hacer login** -- no se guardan en disco
-- Las cookies de sesion se guardan localmente en `.moodle-session.json`
-- Todo se procesa localmente en tu maquina
-- Las transcripciones nunca se suben a ningun servidor externo
-- Claude Code lee los archivos locales directamente
+- Las cookies se guardan localmente en `.moodle-session.json` y las credenciales para re-login en `.moodle-credentials.json`.
+- El archivo de credenciales contiene usuario y contraseña sin cifrar. Se intenta restringir sus permisos en sistemas compatibles; protege la carpeta de trabajo y no compartas ese archivo.
+- Las descargas y transcripciones se guardan localmente. El scraping consulta Moodle, Ingenia y Zoom.
+- Ollama se conecta al servidor configurado en `OLLAMA_HOST` (local por defecto). Claude Code y Gemini CLI son servicios de terceros; revisa sus políticas antes de enviar contenido de clase.
 
 ---
 
@@ -283,6 +326,14 @@ npm install -g @anthropic-ai/claude-code
 # Si elegiste Gemini CLI:
 npm install -g @google/gemini-cli
 ```
+
+### "Ollama no responde" o no encuentra el modelo
+
+Inicia Ollama, descarga un modelo (por ejemplo `ollama pull llama3.2`) y vuelve a ejecutar `claude_udea --ollama`. Si usas otro servidor, configura `OLLAMA_HOST`.
+
+### "No hay transcripciones pendientes" con faster-whisper
+
+Confirma que el directorio pasado con `--work-dir` contenga `recordings.json` y `downloads/`. Para transcribir, instala `faster-whisper` y asegúrate de que `ffmpeg` y `ffprobe` estén en el `PATH`.
 
 ### "externally-managed-environment" al instalar con pip
 Usa un entorno virtual (ver seccion de instalacion arriba).
@@ -312,6 +363,12 @@ rm ~/claude-udea/recordings.json ~/claude-udea/.moodle-session.json
 ```
 
 ---
+
+## Pruebas
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## Licencia
 

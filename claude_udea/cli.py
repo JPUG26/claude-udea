@@ -495,7 +495,7 @@ def _get_assistant(config) -> str:
     return config.get("assistant", "claude")
 
 
-def fase_final(config, recordings, target_courses):
+def fase_final(config, recordings, target_courses, assistant_override=None, ollama_model=None):
     from claude_udea.download import copy_transcripts, count_transcripts, rename_downloads
 
     download_dir = Path(config["download_dir"])
@@ -539,7 +539,22 @@ def fase_final(config, recordings, target_courses):
     )
 
     work_dir = download_dir.parent
-    assistant = _get_assistant(config)
+    assistant = assistant_override or _get_assistant(config)
+
+    if assistant == "none":
+        print("  Modo sin asistente: no se abre Claude Code, Gemini ni Ollama.")
+        print(f"  Tus .vtt están en:\n    {transcripts_dir.resolve()}\n")
+        return
+
+    if assistant == "ollama":
+        from claude_udea.ollama_chat import run_session
+        run_session(
+            work_dir,
+            transcripts_dir,
+            model=ollama_model,
+            session_summary="\n".join(summary_lines),
+        )
+        return
 
     if assistant == "gemini":
         cmd = ["gemini"]
@@ -560,9 +575,20 @@ def fase_final(config, recordings, target_courses):
 # ─── Main ────────────────────────────────────────────────────
 
 def main():
+    from claude_udea.ollama_chat import parse_ollama_model_flag
+    args, ollama_model = parse_ollama_model_flag(sys.argv[1:])
+    use_ollama = "--ollama" in args
+    no_assistant = "--no-assistant" in args or "--no-claude" in args
+    if use_ollama and no_assistant:
+        print("  Usa --ollama o --no-assistant, no ambos.\n")
+        sys.exit(2)
+    if ollama_model and not use_ollama:
+        print("  --ollama-model requiere --ollama.\n")
+        sys.exit(2)
+
     # Validar dependencias
     from claude_udea.deps import check_and_install
-    if not check_and_install():
+    if not check_and_install(skip_assistant=use_ollama or no_assistant):
         sys.exit(1)
 
     import questionary
@@ -578,7 +604,6 @@ def main():
     archive_path = get_archive_path(download_dir)
 
     # Flags
-    args = sys.argv[1:]
     dry_run = "--dry-run" in args
     status_only = "--status" in args
     skip_scrape = "--skip-scrape" in args
@@ -657,6 +682,13 @@ def main():
         skip_scrape=skip_scrape,
     )
 
-    # Organizar transcripciones + Claude Code
+    # Organizar transcripciones + asistente elegido
     if not dry_run:
-        fase_final(config, recordings, target_courses)
+        assistant_override = "ollama" if use_ollama else "none" if no_assistant else None
+        fase_final(
+            config,
+            recordings,
+            target_courses,
+            assistant_override=assistant_override,
+            ollama_model=ollama_model,
+        )
