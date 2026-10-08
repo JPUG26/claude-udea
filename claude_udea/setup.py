@@ -230,6 +230,7 @@ def add_course(work_dir: Path):
     config_path = work_dir / "config.json"
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
+    courses = config.setdefault("courses", {})
 
     source = _source_choices(style).ask()
     if source is None:
@@ -266,11 +267,12 @@ def add_course(work_dir: Path):
     if not slug or slug in courses:
         print(f"  ⚠ Ya existe una asignatura con el nombre corto «{slug}».\n")
         return False
-    config["courses"][slug] = {
+    courses[slug] = {
         "name": name.strip(),
         "moodle_url": url,
         "source": source,
     }
+    config["courses"] = courses
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
