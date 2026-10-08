@@ -427,8 +427,12 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                     sources[source] = _filename_suffix(source.name, rec_id)
 
             for source in course_dir.rglob("*"):
-                if source.is_file() and f"[{rec_id}]" in source.name:
+                if source.is_file() and f"[{rec_id}]" in source.name and source not in sources:
                     sources[source] = _filename_suffix(source.name, rec_id)
+
+            if not sources:
+                # No hay archivos para este recording
+                continue
 
             organized_files = []
             record_files[rec_id] = (rec_info, organized_files)
@@ -469,17 +473,30 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
             if source == destination:
                 organized_files.append(destination.relative_to(course_dir).as_posix())
                 continue
-            temporary = source.with_name(f".{source.name}.{uuid.uuid4().hex}.tmp")
-            source.rename(temporary)
-            staged_plans.append(
-                (temporary, destination, rec_id, rec_info, organized_files)
-            )
+            # Verificar que el archivo fuente existe
+            if not source.exists():
+                print(f"  ⚠ Archivo no encontrado, se omite: {source}")
+                continue
+            # Crear directorio destino primero
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            # Usar nombre temporal en el directorio destino
+            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                source.rename(temporary)
+                staged_plans.append(
+                    (temporary, destination, rec_id, rec_info, organized_files)
+                )
+            except OSError as e:
+                print(f"  ⚠ Error moviendo {source.name}: {e}")
+                continue
 
         for temporary, destination, rec_id, rec_info, organized_files in staged_plans:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary.rename(destination)
-            renamed_count += 1
-            organized_files.append(destination.relative_to(course_dir).as_posix())
+            try:
+                temporary.rename(destination)
+                renamed_count += 1
+                organized_files.append(destination.relative_to(course_dir).as_posix())
+            except OSError as e:
+                print(f"  ⚠ Error renombrando {temporary.name}: {e}")
 
         for rec_id, (rec_info, organized_files) in record_files.items():
             if organized_files:
