@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 from claude_udea.download import (
@@ -52,6 +53,29 @@ class ClassNumberingTests(unittest.TestCase):
             _class_filename(metadata["factory-1"], "2026-02-01"),
             "Fabrica Escuela - Clase #1 - 2026-02-01",
         )
+
+    def test_recovers_legacy_long_organization_and_whisper_temps(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "comprension-lectora-felipe"
+            course_dir.mkdir()
+            intended_video = course_dir / "Clase #12 - 2026-09-02.mp4"
+            temporary_video = course_dir / f".{intended_video.name}.{uuid.uuid4().hex}.tmp"
+            temporary_video.write_bytes(b"video")
+
+            intended_whisper = course_dir / "Clase #13 - 2026-09-04.whisper.transcript.vtt"
+            temporary_whisper = intended_whisper.with_name(intended_whisper.name + ".tmp")
+            temporary_whisper.write_text(
+                "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n",
+                encoding="utf-8",
+            )
+
+            rename_downloads(download_dir, {})
+
+            self.assertEqual(intended_video.read_bytes(), b"video")
+            self.assertTrue(intended_whisper.is_file())
+            self.assertFalse(temporary_video.exists())
+            self.assertFalse(temporary_whisper.exists())
 
     def test_recordings_on_same_date_share_number_within_category(self):
         recordings = {

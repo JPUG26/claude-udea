@@ -25,5 +25,8 @@ whisper = ["faster-whisper>=1.2.0"]
 [tool.setuptools.packages.find]
 include = ["claude_udea*"]
 
+[tool.setuptools]
+py-modules = ["transcribe_missing"]
+
 [tool.setuptools.package-data]
 claude_udea = ["templates/**/*.md", "templates/.claude/**/*.md"]

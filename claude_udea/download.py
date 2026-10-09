@@ -187,7 +187,11 @@ def _class_number_from_filename(filename: str):
 def _class_category(title: str) -> str:
     normalized_title = unicodedata.normalize("NFKD", title)
     normalized_title = normalized_title.encode("ascii", "ignore").decode("ascii").lower()
-    return "fabrica_escuela" if "fabrica de escuela" in normalized_title else "course"
+    return (
+        "fabrica_escuela"
+        if "fabrica de escuela" in normalized_title or "fabrica escuela" in normalized_title
+        else "course"
+    )
 
 
 def _class_category_from_filename(filename: str) -> str:
@@ -197,6 +201,10 @@ def _class_category_from_filename(filename: str) -> str:
 def _class_filename(meta: dict, date_str: str) -> str:
     category = "Fabrica Escuela - " if meta.get("class_category") == "fabrica_escuela" else ""
     return f"{category}Clase #{meta['class_number']} - {date_str}"
+
+
+def recording_filename(meta: dict, suffix: str = "") -> str:
+    return f"{_class_filename(meta, _parse_date_prefix(meta.get('start_date', '')))}{suffix}"
 
 
 def _recording_category(filename: str, suffix: str, source: Path | None = None) -> str:
@@ -324,7 +332,7 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
 
         if meta:
             suffix = _filename_suffix(vtt_file.name, rec_id)
-            new_name = f"{_class_filename(meta, date_str)}{suffix}"
+            new_name = recording_filename(meta, suffix)
         else:
             new_name = f"{date_str}_{vtt_file.name}"
         course_transcripts = transcripts_dir / course_slug
@@ -369,19 +377,8 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
         if not course_dir.is_dir() or course_dir.name in ("transcripts", ".browser-data"):
             continue
         slug = course_dir.name
-
-        for rec_dir in course_dir.iterdir():
-            if not rec_dir.is_dir():
-                continue
-            for vtt_file in rec_dir.glob("*.vtt"):
-                process_vtt(vtt_file, slug)
-
-        for vtt_file in course_dir.glob("*.vtt"):
-            process_vtt(vtt_file, slug)
-
         for vtt_file in course_dir.rglob("*.vtt"):
-            if vtt_file.parent != course_dir:
-                process_vtt(vtt_file, slug)
+            process_vtt(vtt_file, slug)
 
     # Ordenar por fecha
     for slug in index:
@@ -396,8 +393,43 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
     return count
 
 
+def _restore_stale_organization_temps(download_dir: Path) -> None:
+    for temporary in download_dir.rglob(".*.tmp"):
+        if not temporary.is_file() or not temporary.name.startswith("."):
+            continue
+        name_parts = temporary.name[1:-4].rsplit(".", 1)
+        if len(name_parts) != 2:
+            continue
+        intended_name, temp_id = name_parts
+        try:
+            uuid.UUID(hex=temp_id)
+        except ValueError:
+            continue
+        destination = temporary.with_name(intended_name)
+        if not destination.exists():
+            temporary.replace(destination)
+        elif temporary.read_bytes() == destination.read_bytes():
+            temporary.unlink()
+
+    for temporary in download_dir.rglob("*.whisper.transcript.vtt.tmp"):
+        destination = temporary.with_name(temporary.name[:-4])
+        try:
+            content = temporary.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not content.startswith("WEBVTT") or (
+            "generada localmente con faster-whisper" not in content[:500]
+        ):
+            continue
+        if not destination.exists():
+            temporary.replace(destination)
+        elif temporary.read_bytes() == destination.read_bytes():
+            temporary.unlink()
+
+
 def rename_downloads(download_dir: Path, recordings: dict) -> int:
     """Renombra descargas por clase y guarda sus rutas para futuras renumeraciones."""
+    _restore_stale_organization_temps(download_dir)
     id_map = _build_rec_id_map(recordings)
     renamed_count = 0
 
@@ -426,6 +458,13 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                 if source.is_file():
                     sources[source] = _filename_suffix(source.name, rec_id)
 
+            whisper_transcript = (
+                course_dir / "transcripts" / "whisper"
+                / recording_filename(meta, ".whisper.transcript.vtt")
+            )
+            if whisper_transcript.is_file():
+                sources[whisper_transcript] = ".whisper.transcript.vtt"
+
             for source in course_dir.rglob("*"):
                 if source.is_file() and f"[{rec_id}]" in source.name and source not in sources:
                     sources[source] = _filename_suffix(source.name, rec_id)
@@ -436,11 +475,10 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
 
             organized_files = []
             record_files[rec_id] = (rec_info, organized_files)
-            date_str = _parse_date_prefix(meta["start_date"])
             for source, suffix in sources.items():
                 category = _recording_category(source.name, suffix, source)
                 target_dir = course_dir / category if category else source.parent
-                destination = target_dir / f"{_class_filename(meta, date_str)}{suffix}"
+                destination = target_dir / recording_filename(meta, suffix)
                 plans.append((source, destination, rec_id, rec_info, organized_files))
 
         source_paths = {source for source, _, _, _, _ in plans}
@@ -480,7 +518,7 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
             # Crear directorio destino primero
             destination.parent.mkdir(parents=True, exist_ok=True)
             # Usar nombre temporal en el directorio destino
-            temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+            temporary = destination.with_name(f".claude-udea-{uuid.uuid4().hex}.part")
             try:
                 source.rename(temporary)
                 staged_plans.append(

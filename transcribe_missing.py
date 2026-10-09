@@ -7,7 +7,7 @@ Flujo por grabación:
   1. Descarga el video de Zoom con yt-dlp (formato 'view', el más liviano).
     2. Extrae audio 16 kHz mono con ffmpeg; conserva los videos ya organizados.
   3. Transcribe con faster-whisper (small, int8, VAD) y escribe
-     'TITULO [REC_ID].transcript.vtt' en downloads/<asignatura>/.
+     la transcripción en downloads/<asignatura>/transcripts/whisper/.
   4. Borra el audio y regenera downloads/transcripts/ + index.json
      con copy_transcripts() (el mismo paso del proceso normal).
 
@@ -23,16 +23,20 @@ import hashlib
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOL_DIR))
 
-from claude_udea.download import copy_transcripts  # noqa: E402
+from claude_udea.download import (  # noqa: E402
+    _build_rec_id_map,
+    copy_transcripts,
+    recording_filename,
+)
 
 MODEL_SIZE = "small"          # mejor balance calidad/velocidad en Pi 5 (~1x tiempo real)
 COMPUTE_TYPE = "int8"
@@ -156,14 +160,18 @@ def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path):
     for part_json in sorted(parts_dir.glob("part*.json")):
         cues.extend(json.loads(part_json.read_text(encoding="utf-8")))
 
-    temporary_vtt = dest_vtt.with_name(dest_vtt.name + ".tmp")
-    with open(temporary_vtt, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\nNOTE\nTranscripción generada localmente con "
-                f"faster-whisper ({MODEL_SIZE}, {COMPUTE_TYPE})\n\n")
-        for i, seg in enumerate(cues, 1):
-            f.write(f"{i}\n{fmt_ts(seg['start'])} --> {fmt_ts(seg['end'])}\n"
-                    f"{seg['text']}\n\n")
-    temporary_vtt.replace(dest_vtt)
+    dest_vtt.parent.mkdir(parents=True, exist_ok=True)
+    temporary_vtt = dest_vtt.with_name(f".whisper-{uuid.uuid4().hex}.part")
+    try:
+        with open(temporary_vtt, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n\nNOTE\nTranscripción generada localmente con "
+                    f"faster-whisper ({MODEL_SIZE}, {COMPUTE_TYPE})\n\n")
+            for i, seg in enumerate(cues, 1):
+                f.write(f"{i}\n{fmt_ts(seg['start'])} --> {fmt_ts(seg['end'])}\n"
+                        f"{seg['text']}\n\n")
+        temporary_vtt.replace(dest_vtt)
+    finally:
+        temporary_vtt.unlink(missing_ok=True)
     shutil.rmtree(parts_dir, ignore_errors=True)
 
 
@@ -182,8 +190,16 @@ def _recording_transcripts(course_dir: Path, rec_id: str, rec_info: dict) -> lis
     ]
 
 
-def _has_whisper_transcript(course_dir: Path, rec_id: str, rec_info: dict) -> bool:
-    for transcript in _recording_transcripts(course_dir, rec_id, rec_info):
+def _has_whisper_transcript(
+    course_dir: Path,
+    rec_id: str,
+    rec_info: dict,
+    expected_transcript: Path | None = None,
+) -> bool:
+    candidates = _recording_transcripts(course_dir, rec_id, rec_info)
+    if expected_transcript and expected_transcript.is_file():
+        candidates.append(expected_transcript)
+    for transcript in candidates:
         try:
             if "generada localmente con faster-whisper" in transcript.read_text(
                 encoding="utf-8", errors="replace"
@@ -204,12 +220,6 @@ def _existing_video(course_dir: Path, rec_id: str, rec_info: dict) -> Path | Non
         if candidate.is_file() and rec_id in candidate.name and candidate.suffix.lower() in video_extensions:
             return candidate
     return None
-
-
-def _transcript_filename(title: str, rec_id: str) -> str:
-    safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", title).strip(" .")
-    safe_id = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", rec_id).strip(" .")
-    return f"{safe_title or 'Clase'} [{safe_id}].whisper.transcript.vtt"
 
 
 def has_zoom_transcripts(work_dir: Path, course_slugs: list[str] | None = None) -> bool:
@@ -244,6 +254,7 @@ def transcribe_all(
     download_dir = work_dir / "downloads"
     cache_dir = work_dir / ".media-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    id_map = _build_rec_id_map(recordings)
 
     pending = []
     for slug in selected_courses:
@@ -252,7 +263,14 @@ def transcribe_all(
             continue
         course_dir = download_dir / slug
         for rec_id, rec_info in course.get("recordings", {}).items():
-            if rec_info.get("url") and not _has_whisper_transcript(course_dir, rec_id, rec_info):
+            metadata = id_map[rec_id]
+            expected_transcript = (
+                course_dir / "transcripts" / "whisper"
+                / recording_filename(metadata, ".whisper.transcript.vtt")
+            )
+            if rec_info.get("url") and not _has_whisper_transcript(
+                course_dir, rec_id, rec_info, expected_transcript
+            ):
                 pending.append((slug, rec_id, rec_info))
 
     if not pending:
@@ -303,7 +321,11 @@ def transcribe_all(
             if extracted != wav:
                 extracted.replace(wav)
 
-        destination = course_dir / _transcript_filename(title, rec_id)
+        destination = (
+            course_dir / "transcripts" / "whisper"
+            / recording_filename(id_map[rec_id], ".whisper.transcript.vtt")
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
         parts_dir = cache_dir / f"parts-{hashlib.sha256(rec_id.encode()).hexdigest()[:16]}"
         log(f"  Transcribiendo con faster-whisper: {label}")
         try:
