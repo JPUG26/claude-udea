@@ -638,12 +638,12 @@ def _sync_moodle_materials(work_dir: Path, config: dict, target_courses: list[st
         print("  ✔ Materiales Moodle sincronizados.\n")
 
 
-def _sync_ingenia_materials(work_dir: Path, course_url: str):
-    from claude_udea.ingenia import sync_course_materials
-
-    manifest = sync_course_materials(course_url, work_dir)
+def _print_ingenia_manifest(work_dir: Path, manifest: dict):
+    if "error" in manifest:
+        print(f"  ⚠ {manifest['course']}: no se pudo sincronizar: {manifest['error']}\n")
+        return
     print(
-        f"  ✔ Ingenia: {manifest['file_count']} archivos, "
+        f"  ✔ Ingenia {manifest['course']}: {manifest['file_count']} archivos, "
         f"{manifest['page_count']} páginas, "
         f"{manifest['external_link_count']} enlaces externos, "
         f"{len(manifest['failures'])} fallos"
@@ -651,6 +651,24 @@ def _sync_ingenia_materials(work_dir: Path, course_url: str):
     print(f"    {work_dir / 'course-materials' / f"ingenia-{manifest['course_id']}"}")
     if manifest["failures"]:
         print("  ⚠ Algunos recursos no pudieron descargarse; revisa el manifest.json.\n")
+
+
+def _sync_ingenia_materials(work_dir: Path, course_url: str):
+    from claude_udea.ingenia import sync_course_materials
+
+    _print_ingenia_manifest(work_dir, sync_course_materials(course_url, work_dir))
+
+
+def _sync_all_ingenia_materials(work_dir: Path):
+    from claude_udea.ingenia import sync_all_course_materials
+
+    manifests = sync_all_course_materials(work_dir)
+    if not manifests:
+        print("  No encontré cursos Ingenia en la cuenta.\n")
+        return
+    for manifest in manifests:
+        _print_ingenia_manifest(work_dir, manifest)
+    print(f"  ✔ Ingenia: {len(manifests)} cursos procesados.\n")
 
 
 # ─── Main ────────────────────────────────────────────────────
@@ -678,11 +696,12 @@ def main():
             sys.exit(1)
         work_dir = _get_work_dir()
         url_index = args.index("--sync-ingenia-materials") + 1
-        if url_index >= len(args) or args[url_index].startswith("--"):
-            print("  Uso: claude_udea --sync-ingenia-materials <URL-del-curso>\n")
-            sys.exit(2)
+        has_url = url_index < len(args) and not args[url_index].startswith("--")
         try:
-            _sync_ingenia_materials(work_dir, args[url_index])
+            if has_url:
+                _sync_ingenia_materials(work_dir, args[url_index])
+            else:
+                _sync_all_ingenia_materials(work_dir)
         except (PermissionError, RuntimeError, ValueError) as error:
             print(f"  ⚠ {error}\n")
             sys.exit(1)

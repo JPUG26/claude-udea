@@ -216,7 +216,8 @@ claude_udea --ollama --ollama-model mistral  # Elegir modelo local
 claude_udea --no-claude       # Alias compatible de --no-assistant
 claude_udea --sync-materials  # Solo materiales Moodle; no descarga grabaciones
 claude_udea --skip-materials  # Omitir materiales en el flujo normal
-claude_udea --sync-ingenia-materials "https://ingenia.udea.edu.co/campus/course/view.php?id=215"
+claude_udea --sync-ingenia-materials   # Materiales de todos los cursos Ingenia de la cuenta
+claude_udea --sync-ingenia-materials "https://ingenia.udea.edu.co/campus/course/view.php?id=215"  # Solo un curso
 claude_udea --always-whisper --skip-video # Crear VTT con faster-whisper
 ```
 

@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -118,6 +119,68 @@ class IngeniaLoginTests(unittest.TestCase):
         self.assertEqual(slug, "course-slug")
         self.assertEqual(links, [])
         self.assertEqual(session.get.call_count, 3)
+
+
+class IngeniaCourseDiscoveryTests(unittest.TestCase):
+    DASHBOARD_HTML = (
+        '<div class="course-card">'
+        f'<a href="{ingenia.BASE_URL}/course/view.php?id=215"><span>Arquitectura de Software</span></a>'
+        '<a href="/campus/course/view.php?id=215">Arquitectura de Software</a>'
+        '<a href="/campus/course/view.php?id=310">Fábrica Escuela</a>'
+        '<a href="/campus/course/view.php?id=abc">Inválido</a>'
+        '<a href="https://otro.example.com/course/view.php?id=999">Externo</a>'
+        '</div>'
+    )
+
+    def test_list_courses_reads_unique_course_ids_from_dashboard(self):
+        response = SimpleNamespace(
+            url=ingenia.MY_URL,
+            text=self.DASHBOARD_HTML,
+            raise_for_status=Mock(),
+        )
+        session = Mock()
+        session.get.return_value = response
+
+        courses = ingenia.list_courses(session)
+
+        self.assertEqual(
+            courses,
+            [
+                {
+                    "name": "Arquitectura de Software",
+                    "course_url": f"{ingenia.BASE_URL}/course/view.php?id=215",
+                },
+                {
+                    "name": "Fábrica Escuela",
+                    "course_url": f"{ingenia.BASE_URL}/course/view.php?id=310",
+                },
+            ],
+        )
+
+    def test_sync_all_keeps_going_when_one_course_fails(self):
+        courses = [
+            {"name": "Curso A", "course_url": f"{ingenia.BASE_URL}/course/view.php?id=1"},
+            {"name": "Curso B", "course_url": f"{ingenia.BASE_URL}/course/view.php?id=2"},
+        ]
+        ok_manifest = {"course": "Curso B", "course_id": "2", "failures": []}
+
+        def fake_scrape(session, course_info, destination):
+            if course_info["name"] == "Curso A":
+                raise PermissionError("La sesión de Moodle expiró al abrir el curso.")
+            return ok_manifest
+
+        with (
+            patch.object(ingenia, "login", return_value=Mock()),
+            patch.object(ingenia, "list_courses", return_value=courses),
+            patch.object(ingenia, "scrape_course_materials", side_effect=fake_scrape) as scrape,
+        ):
+            results = ingenia.sync_all_course_materials(Path("C:/claude-udea"))
+
+        self.assertEqual(len(results), 2)
+        self.assertIn("error", results[0])
+        self.assertEqual(results[0]["course"], "Curso A")
+        self.assertEqual(results[1], ok_manifest)
+        self.assertEqual(scrape.call_args_list[1].args[2].name, "ingenia-2")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ from __future__ import annotations
 import getpass
 import json
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -126,20 +126,66 @@ def login() -> requests.Session:
     return session
 
 
-def sync_course_materials(course_url: str, work_dir: Path) -> dict:
+def _course_id_from_url(course_url: str) -> str:
     parsed = urlparse(course_url)
     if parsed.hostname != "ingenia.udea.edu.co" or not parsed.path.startswith("/campus/course/view.php"):
         raise ValueError("Usa una URL de curso Ingenia /campus/course/view.php?id=...")
-    session = login()
-    from urllib.parse import parse_qs
-
     course_id = parse_qs(parsed.query).get("id", [""])[0]
     if not course_id.isdigit():
         raise ValueError("La URL del curso Ingenia debe incluir un id numérico.")
-    slug = f"ingenia-{course_id}"
-    course_info = {
-        "name": f"Ingenia {slug.removeprefix('ingenia-')}",
-        "course_url": course_url,
-    }
-    destination = work_dir / "course-materials" / slug
+    return course_id
+
+
+def list_courses(session: requests.Session) -> list[dict]:
+    """Lee del panel de Ingenia los cursos en los que la cuenta está matriculada."""
+    response = session.get(MY_URL, timeout=30)
+    response.raise_for_status()
+    if "/login/" in urlparse(response.url).path.lower():
+        raise PermissionError("La sesión de Ingenia expiró al leer el panel de cursos.")
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    courses = {}
+    for anchor in soup.select('a[href*="/course/view.php"]'):
+        url = urljoin(response.url, anchor.get("href", ""))
+        parsed = urlparse(url)
+        if parsed.hostname != "ingenia.udea.edu.co":
+            continue
+        course_id = parse_qs(parsed.query).get("id", [""])[0]
+        if not course_id.isdigit() or course_id in courses:
+            continue
+        name = anchor.get_text(" ", strip=True) or f"Curso {course_id}"
+        courses[course_id] = {
+            "name": name,
+            "course_url": f"{BASE_URL}/course/view.php?id={course_id}",
+        }
+    return list(courses.values())
+
+
+def _sync_one(session: requests.Session, course_info: dict, work_dir: Path) -> dict:
+    course_id = _course_id_from_url(course_info["course_url"])
+    destination = work_dir / "course-materials" / f"ingenia-{course_id}"
     return scrape_course_materials(session, course_info, destination)
+
+
+def sync_course_materials(course_url: str, work_dir: Path) -> dict:
+    course_id = _course_id_from_url(course_url)
+    session = login()
+    course_info = {"name": f"Ingenia {course_id}", "course_url": course_url}
+    return _sync_one(session, course_info, work_dir)
+
+
+def sync_all_course_materials(work_dir: Path) -> list[dict]:
+    """Sincroniza los materiales de todos los cursos Ingenia de la cuenta.
+
+    Un curso que falle no detiene a los demás; el error se registra en su resultado.
+    """
+    session = login()
+    results = []
+    for course_info in list_courses(session):
+        try:
+            manifest = _sync_one(session, course_info, work_dir)
+        except (OSError, requests.RequestException, ValueError, PermissionError) as error:
+            manifest = {"course": course_info["name"], "error": str(error), "failures": []}
+        manifest.setdefault("course", course_info["name"])
+        results.append(manifest)
+    return results
