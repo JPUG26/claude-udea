@@ -228,5 +228,27 @@ class ClassNumberingTests(unittest.TestCase):
             )
 
 
+class RecordingsStoreTests(unittest.TestCase):
+    def test_load_keeps_recordings_that_share_a_start_date(self):
+        from claude_udea.cli import load_recordings
+
+        data = {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {
+                    "class-1": {"title": "Arquitectura de Software", "start_date": "2026-09-01T17:01:34Z"},
+                    "factory-1": {"title": "FABRICA DE ESCUELA", "start_date": "2026-09-01T17:01:34Z"},
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "recordings.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+
+            loaded = load_recordings(path)
+
+        self.assertEqual(set(loaded["arquitectura-de-software"]["recordings"]), {"class-1", "factory-1"})
+
+
 if __name__ == "__main__":
     unittest.main()

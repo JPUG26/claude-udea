@@ -192,35 +192,10 @@ def load_config(work_dir: Path):
 
 def load_recordings(path: Path) -> dict:
     if path.exists():
+        # No se deduplica por fecha: dos clases (p. ej. Fábrica Escuela y una clase
+        # normal) pueden empezar a la misma hora y ambas son grabaciones distintas.
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Deduplicar por start_date dentro de cada curso
-        changed = False
-        for slug, course in data.items():
-            recs = course.get("recordings", {})
-            seen_dates = {}
-            to_remove = []
-            for rec_id, rec_info in recs.items():
-                sd = rec_info.get("start_date", "")
-                if not sd:
-                    continue
-                if sd in seen_dates:
-                    # Mantener el que ya fue descargado, o el primero
-                    existing_id = seen_dates[sd]
-                    if rec_info.get("downloaded") and not recs[existing_id].get("downloaded"):
-                        to_remove.append(existing_id)
-                        seen_dates[sd] = rec_id
-                    else:
-                        to_remove.append(rec_id)
-                else:
-                    seen_dates[sd] = rec_id
-            for rid in to_remove:
-                del recs[rid]
-                changed = True
-        if changed:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        return data
+            return json.load(f)
     return {}
 
 
@@ -280,13 +255,14 @@ def _merge_scraped(existing, config, slug, links):
         }
 
     course_data = existing[slug]
-    from claude_udea.download import backfill_recording_metadata
+    from claude_udea.download import _class_category, backfill_recording_metadata
     backfill_recording_metadata(
         Path(config["download_dir"]) / slug, course_data, links
     )
 
+    # Una grabación se considera conocida por fecha y tipo de clase, no solo por fecha
     known_dates = {
-        rec["start_date"]
+        (rec["start_date"], _class_category(rec.get("title", "")))
         for rec in course_data["recordings"].values()
         if rec.get("start_date")
     }
@@ -313,13 +289,14 @@ def _merge_scraped(existing, config, slug, links):
                 )
                 rec_info["downloaded"] = True
             continue
-        if start_date and start_date in known_dates:
+        title = link.get("topic") or link["text"]
+        if start_date and (start_date, _class_category(title)) in known_dates:
             continue
 
         rec_info = {
             "url": link["full_url"],
             "share_url": link["url"],
-            "title": link.get("topic") or link["text"],
+            "title": title,
             "meeting_id": link.get("meeting_id", ""),
             "start_date": start_date,
             "duration_minutes": link.get("duration_minutes", 0),
@@ -329,7 +306,7 @@ def _merge_scraped(existing, config, slug, links):
         if link.get("_existing_files"):
             rec_info["organized_files"] = link["_existing_files"]
         course_data["recordings"][rec_id] = rec_info
-        known_dates.add(start_date)
+        known_dates.add((start_date, _class_category(title)))
         url = rec_info.get("url") or rec_info.get("share_url", "")
         if url and not rec_info["downloaded"]:
             new_pending.append((slug, rec_id, rec_info, url))
