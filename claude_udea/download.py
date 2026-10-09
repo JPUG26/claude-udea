@@ -207,8 +207,19 @@ def recording_filename(meta: dict, suffix: str = "") -> str:
     return f"{_class_filename(meta, _parse_date_prefix(meta.get('start_date', '')))}{suffix}"
 
 
+_INCOMPLETE_RE = re.compile(r"\.(?:part|tmp|ytdl)$", re.IGNORECASE)
+_LOOSE_CLASS_RE = re.compile(
+    r"^(?:Fabrica Escuela - )?Clase #(\d+) - (\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+_ID_MARKER_RE = re.compile(r"\[[^\]]+\]")
+
+
 def _recording_category(filename: str, suffix: str, source: Path | None = None) -> str:
     lowered = (filename + suffix).lower()
+    if _INCOMPLETE_RE.search(lowered):
+        # Descargas interrumpidas o copias temporales: no son videos ni transcripciones
+        return "incompletos"
     if lowered.endswith(".vtt"):
         is_whisper = ".whisper.transcript." in lowered
         if not is_whisper and source and source.is_file():
@@ -445,6 +456,7 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
         ):
             (course_dir / category_dir).mkdir(parents=True, exist_ok=True)
 
+        loose_sources = _loose_sources_by_recording(course_dir, slug, id_map)
         plans = []
         record_files = {}
         for rec_id, rec_info in course.get("recordings", {}).items():
@@ -452,7 +464,7 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
             if not meta:
                 continue
 
-            sources = {}
+            sources = dict(loose_sources.get(rec_id, {}))
             for relative_name in rec_info.get("organized_files", []):
                 source = course_dir / relative_name
                 if source.is_file():
@@ -540,7 +552,54 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
             if organized_files:
                 rec_info["organized_files"] = organized_files
 
+        _sweep_unclassified(course_dir)
+
     return renamed_count
+
+
+def _loose_sources_by_recording(course_dir: Path, slug: str, id_map: dict) -> dict:
+    """Asocia archivos de la raíz del curso sin ID (p. ej. 'Fabrica Escuela - Clase #3 - 2026-08-26.mp4')
+    con su grabación por categoría, número de clase y fecha."""
+    index = {}
+    for rec_id, meta in id_map.items():
+        if meta["slug"] != slug:
+            continue
+        date_str = _parse_date_prefix(meta.get("start_date", ""))
+        index[(meta["class_category"], meta["class_number"], date_str)] = rec_id
+
+    loose = {}
+    for entry in course_dir.iterdir():
+        if not entry.is_file() or _ID_MARKER_RE.search(entry.name):
+            continue
+        match = _LOOSE_CLASS_RE.match(entry.name)
+        if not match:
+            continue
+        key = (_class_category_from_filename(entry.name), int(match.group(1)), match.group(2))
+        rec_id = index.get(key)
+        if rec_id:
+            loose.setdefault(rec_id, {})[entry] = _filename_suffix(entry.name, "")
+    return loose
+
+
+_SWEEP_SUFFIXES = {
+    ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".wav", ".vtt", ".srt",
+    ".txt", ".json", ".csv", ".part", ".tmp", ".ytdl",
+}
+
+
+def _sweep_unclassified(course_dir: Path) -> None:
+    """Mueve a sin-clasificar/ los archivos del curso que quedaron en la raíz sin destino."""
+    for entry in course_dir.iterdir():
+        if not entry.is_file() or entry.suffix.lower() not in _SWEEP_SUFFIXES:
+            continue
+        category = "incompletos" if _INCOMPLETE_RE.search(entry.name) else "sin-clasificar"
+        target_dir = course_dir / category
+        destination = target_dir / entry.name
+        if destination.exists():
+            print(f"  ⚠ Ya existe {destination.relative_to(course_dir.parent)}; no se mueve {entry.name}")
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        entry.rename(destination)
 
 
 def backfill_recording_metadata(course_dir: Path, course: dict, links: list[dict]) -> int:

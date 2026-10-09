@@ -228,6 +228,73 @@ class ClassNumberingTests(unittest.TestCase):
             )
 
 
+class LooseFileOrganizationTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.download_dir = Path(self._temporary.name)
+        self.course_dir = self.download_dir / "arquitectura-de-software"
+        self.course_dir.mkdir()
+        self.recordings = {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {
+                    "factory-3": {
+                        "title": "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA (2026-2)",
+                        "start_date": "2026-08-26T10:59:13Z",
+                        "downloaded": True,
+                    },
+                },
+            },
+        }
+
+    def tearDown(self):
+        self._temporary.cleanup()
+
+    def test_loose_factory_files_without_id_go_to_their_category_with_standard_name(self):
+        loose_video = self.course_dir / "Fabrica Escuela - Clase #1 - 2026-08-26.mp4"
+        loose_video.write_bytes(b"video")
+        loose_vtt = self.course_dir / "Fabrica Escuela - Clase #1 - 2026-08-26.transcript.vtt"
+        loose_vtt.write_text("WEBVTT\n", encoding="utf-8")
+
+        rename_downloads(self.download_dir, self.recordings)
+
+        self.assertTrue((self.course_dir / "videos" / "Fabrica Escuela - Clase #1 - 2026-08-26.mp4").is_file())
+        self.assertTrue(
+            (self.course_dir / "transcripts" / "zoom" / "Fabrica Escuela - Clase #1 - 2026-08-26.transcript.vtt").is_file()
+        )
+        self.assertFalse(loose_video.exists())
+        self.assertFalse(loose_vtt.exists())
+
+    def test_partial_and_temporary_downloads_are_kept_out_of_videos(self):
+        partial = self.course_dir / "Clase #4 - 2026-09-05.mp4.part"
+        partial.write_bytes(b"partial")
+        legacy_temp = self.course_dir / "Clase #6 - 2026-09-12.mp4.3223.tmp.f1f7.tmp"
+        legacy_temp.write_bytes(b"partial")
+
+        rename_downloads(self.download_dir, self.recordings)
+
+        self.assertTrue((self.course_dir / "incompletos" / partial.name).is_file())
+        self.assertTrue((self.course_dir / "incompletos" / legacy_temp.name).is_file())
+        self.assertEqual(list((self.course_dir / "videos").glob("*.part")), [])
+
+    def test_unresolvable_root_files_are_swept_to_sin_clasificar(self):
+        orphan = self.course_dir / "clase #17 - sin-fecha - chapter.vtt"
+        orphan.write_text("WEBVTT\n", encoding="utf-8")
+
+        rename_downloads(self.download_dir, self.recordings)
+
+        self.assertFalse(orphan.exists())
+        self.assertTrue((self.course_dir / "sin-clasificar" / orphan.name).is_file())
+
+    def test_file_with_id_and_no_recording_is_swept_not_left_in_root(self):
+        stray = self.course_dir / "Algo [unknown-id].mp4"
+        stray.write_bytes(b"video")
+
+        rename_downloads(self.download_dir, self.recordings)
+
+        self.assertFalse(stray.exists())
+        self.assertTrue((self.course_dir / "sin-clasificar" / stray.name).is_file())
+
 class RecordingsStoreTests(unittest.TestCase):
     def test_load_keeps_recordings_that_share_a_start_date(self):
         from claude_udea.cli import load_recordings
