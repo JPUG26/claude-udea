@@ -255,21 +255,18 @@ def _merge_scraped(existing, config, slug, links):
         }
 
     course_data = existing[slug]
-    from claude_udea.download import _class_category, backfill_recording_metadata
+    from claude_udea.download import backfill_recording_metadata
     backfill_recording_metadata(
         Path(config["download_dir"]) / slug, course_data, links
     )
 
-    # Una grabación se considera conocida por fecha y tipo de clase, no solo por fecha
-    known_dates = {
-        (rec["start_date"], _class_category(rec.get("title", "")))
-        for rec in course_data["recordings"].values()
-        if rec.get("start_date")
-    }
-
     new_pending = []
+    seen_ids = set()
     for link in links:
         rec_id = extract_recording_id(link["url"])
+        if rec_id in seen_ids:
+            continue
+        seen_ids.add(rec_id)
         start_date = link.get("start_date", "")
 
         if rec_id in course_data["recordings"]:
@@ -282,16 +279,21 @@ def _merge_scraped(existing, config, slug, links):
             duration = link.get("duration_minutes")
             if duration or not rec_info.get("duration_minutes"):
                 rec_info["duration_minutes"] = duration or 0
+            rec_info["video_downloaded"] = _has_video_artifact(
+                Path(config["download_dir"]) / slug, rec_info, rec_id
+            )
+            rec_info["downloaded"] = rec_info["video_downloaded"]
             if link.get("_existing_files"):
                 rec_info["organized_files"] = sorted(
                     set(rec_info.get("organized_files", []))
                     | set(link["_existing_files"])
                 )
-                rec_info["downloaded"] = True
+                rec_info["video_downloaded"] = _has_video_artifact(
+                    Path(config["download_dir"]) / slug, rec_info, rec_id
+                )
+                rec_info["downloaded"] = rec_info["video_downloaded"]
             continue
         title = link.get("topic") or link["text"]
-        if start_date and (start_date, _class_category(title)) in known_dates:
-            continue
 
         rec_info = {
             "url": link["full_url"],
@@ -301,18 +303,69 @@ def _merge_scraped(existing, config, slug, links):
             "start_date": start_date,
             "duration_minutes": link.get("duration_minutes", 0),
             "scraped_at": datetime.now().isoformat(),
-            "downloaded": bool(link.get("_already_downloaded")),
+            "downloaded": False,
         }
         if link.get("_existing_files"):
             rec_info["organized_files"] = link["_existing_files"]
         course_data["recordings"][rec_id] = rec_info
-        known_dates.add((start_date, _class_category(title)))
         url = rec_info.get("url") or rec_info.get("share_url", "")
         if url and not rec_info["downloaded"]:
             new_pending.append((slug, rec_id, rec_info, url))
 
     course_data["last_scraped"] = datetime.now().isoformat()
     return new_pending
+
+
+def _has_video_artifact(course_dir: Path, rec_info: dict, rec_id: str) -> bool:
+    """True only when a complete video file for this recording exists on disk."""
+    video_extensions = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+    candidates = []
+    for relative_name in rec_info.get("organized_files", []):
+        path = course_dir / relative_name
+        if path.suffix.lower() in video_extensions:
+            candidates.append(path)
+    candidates.extend(
+        path for path in course_dir.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in video_extensions
+        and f"[{rec_id}" in path.name
+    )
+    for path in candidates:
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+
+    # organized_files may be stale (files renamed by organizer).
+    # Fallback: match clean video names by category prefix and date.
+    start_date = rec_info.get("start_date", "")
+    date_prefix = start_date[:10] if start_date else ""
+    if not date_prefix or not date_prefix[0].isdigit():
+        return False
+    title = rec_info.get("title", "").casefold()
+    category_prefix = "fabrica escuela - clase #" if (
+        "fabrica de escuela" in title or "fabrica escuela" in title
+    ) else "clase #"
+    date_marker = f" - {date_prefix}"
+
+    for path in course_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in video_extensions:
+            continue
+        name = path.name.casefold()
+        if name.startswith(category_prefix) and date_marker in name:
+            try:
+                if path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+
+    return False
+
+
+def _recording_video_missing(course_dir: Path, rec_info: dict, rec_id: str) -> bool:
+    """Return false when a canonical, previously organized video is present."""
+    return not _has_video_artifact(course_dir, rec_info, rec_id)
 
 
 def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, skip_video, dry_run, skip_scrape=False):
@@ -323,7 +376,7 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from claude_udea.auth import login, _scrape_one
-    from claude_udea.download import get_archive_path, is_downloaded, download_one
+    from claude_udea.download import get_archive_path, download_one
     from tqdm import tqdm
 
     existing = load_recordings(recordings_path)
@@ -341,13 +394,14 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
         )
         session = login(work_dir) if has_moodle_courses else requests.Session()
 
-    # Contar ya descargadas
+    # El archive no demuestra que el video siga en disco; se valida por artefacto.
     already = 0
     for slug in target_courses:
         if slug not in existing:
             continue
         for rec_id, rec_info in existing[slug].get("recordings", {}).items():
-            if rec_info.get("downloaded") or is_downloaded(archive_path, rec_id):
+            video_present = not _recording_video_missing(download_dir / slug, rec_info, rec_id)
+            if not skip_video and video_present:
                 already += 1
 
     total_new = 0
@@ -392,7 +446,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 pending = []
                 for item in new_pending:
                     _, rec_id, _, _ = item
-                    if not is_downloaded(archive_path, rec_id):
+                    rec_info = item[2]
+                    if skip_video or _recording_video_missing(download_dir / slug, rec_info, rec_id):
                         pending.append(item)
                     else:
                         already += 1
@@ -400,7 +455,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 # También agregar pendientes de ejecuciones previas
                 if slug in existing:
                     for rec_id, rec_info in existing[slug].get("recordings", {}).items():
-                        if rec_info.get("downloaded") or is_downloaded(archive_path, rec_id):
+                        video_present = not _recording_video_missing(download_dir / slug, rec_info, rec_id)
+                        if not skip_video and video_present:
                             continue
                         url = rec_info.get("url") or rec_info.get("share_url", "")
                         if url and not any(p[1] == rec_id for p in pending):
@@ -422,7 +478,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 if slug not in existing:
                     continue
                 for rec_id, rec_info in existing[slug].get("recordings", {}).items():
-                    if rec_info.get("downloaded") or is_downloaded(archive_path, rec_id):
+                    video_present = not _recording_video_missing(download_dir / slug, rec_info, rec_id)
+                    if not skip_video and video_present:
                         already += 1
                         continue
                     url = rec_info.get("url") or rec_info.get("share_url", "")
@@ -443,9 +500,18 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
             for slug_d, rec_id, rec_info, df in download_futures:
                 status = df.result()
                 if status == "ok":
-                    rec_info["downloaded"] = True
-                    rec_info["downloaded_at"] = datetime.now().isoformat()
-                    total_ok += 1
+                    if not skip_video:
+                        rec_info["video_downloaded"] = _has_video_artifact(
+                            Path(config["download_dir"]) / slug_d, rec_info, rec_id
+                        )
+                        rec_info["downloaded"] = rec_info["video_downloaded"]
+                        if rec_info["video_downloaded"]:
+                            rec_info["downloaded_at"] = datetime.now().isoformat()
+                    if skip_video or rec_info.get("video_downloaded"):
+                        total_ok += 1
+                    else:
+                        total_failed += 1
+                        rec_info["download_error"] = "yt-dlp terminó sin producir un archivo de video"
                 elif status == "processing":
                     total_processing += 1
                 else:
@@ -487,12 +553,11 @@ def _get_assistant(config) -> str:
 
 
 def fase_final(config, recordings, target_courses, assistant_override=None, ollama_model=None):
-    from claude_udea.download import cleanup_legacy_duplicate_names, copy_transcripts, count_transcripts, rename_downloads
+    from claude_udea.download import copy_transcripts, count_transcripts, rename_downloads
 
     download_dir = Path(config["download_dir"])
 
     with Spinner("Organizando transcripciones..."):
-        cleanup_legacy_duplicate_names(download_dir, recordings)
         rename_downloads(download_dir, recordings)
         copy_transcripts(download_dir, recordings)
         save_recordings(Path(config["recordings_file"]), recordings)
@@ -701,7 +766,7 @@ def main():
     recordings_path = Path(config["recordings_file"])
     download_dir = Path(config["download_dir"])
 
-    from claude_udea.download import get_archive_path, is_downloaded
+    from claude_udea.download import get_archive_path
     archive_path = get_archive_path(download_dir)
 
     # Flags
@@ -744,7 +809,12 @@ def main():
         for slug, course in recordings.items():
             recs = course.get("recordings", {})
             ct = len(recs)
-            cd = sum(1 for rid in recs if is_downloaded(archive_path, rid))
+            cd = sum(
+                1 for rid, rec_info in recs.items()
+                if not _recording_video_missing(
+                    Path(config["download_dir"]) / slug, rec_info, rid
+                )
+            )
             s = "✔" if cd == ct else "…"
             print(f"  {s} {course['name']}: {cd}/{ct}")
         print()

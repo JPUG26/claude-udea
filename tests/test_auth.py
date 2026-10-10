@@ -75,5 +75,56 @@ class SecureAuthStorageTests(unittest.TestCase):
         )
 
 
+class MoodleRecordingPaginationTests(unittest.TestCase):
+    @staticmethod
+    def page(recording_id, pager=""):
+        return f"""
+        <table class="generaltable"><tbody>
+          <tr><td>meeting</td><td>Architecture</td><td>2026-09-01</td><td>60</td>
+          <td><input name="zoomplayredirect" value="https://zoom.example/rec/share/{recording_id}"></td></tr>
+        </tbody></table>{pager}
+        """
+
+    def test_scrapes_all_same_activity_pager_pages_and_deduplicates_ids(self):
+        initial_url = "https://udearroba.udea.edu.co/internos/mod/recordingszoom/recordinglist.php?id=123"
+        page_two = initial_url + "&page=1"
+        page_three = initial_url + "&page=2"
+        responses = {
+            initial_url: self.page("rec-1", f'<div class="pagination"><a href="{page_two}">Siguiente</a></div>'),
+            page_two: self.page("rec-2", f'<nav class="pagination"><a href="{page_three}">Next</a></nav>'),
+            page_three: self.page("rec-2", f'<div class="pagination"><a href="{page_two}">Previous</a></div>'),
+        }
+        session = Mock()
+        session.get.side_effect = lambda url, **kwargs: SimpleNamespace(
+            url=url, text=responses[url], raise_for_status=Mock()
+        )
+
+        slug, links = auth._scrape_one(
+            session, "architecture", {"name": "Architecture", "moodle_url": initial_url}
+        )
+
+        self.assertEqual(slug, "architecture")
+        self.assertEqual([link["id"] for link in links], ["rec-1", "rec-2"])
+        self.assertEqual(session.get.call_count, 3)
+
+    def test_does_not_follow_pager_links_to_a_different_activity(self):
+        initial_url = "https://udearroba.udea.edu.co/internos/mod/recordingszoom/recordinglist.php?id=123"
+        other_url = "https://udearroba.udea.edu.co/internos/mod/recordingszoom/recordinglist.php?id=999&page=1"
+        response = SimpleNamespace(
+            url=initial_url,
+            text=self.page("rec-1", f'<div class="pagination"><a href="{other_url}">Next</a></div>'),
+            raise_for_status=Mock(),
+        )
+        session = Mock()
+        session.get.return_value = response
+
+        _, links = auth._scrape_one(
+            session, "architecture", {"name": "Architecture", "moodle_url": initial_url}
+        )
+
+        self.assertEqual(len(links), 1)
+        self.assertEqual(session.get.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

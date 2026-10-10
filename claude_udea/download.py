@@ -4,6 +4,7 @@ Aislado para que cambios en otras partes no lo afecten.
 """
 
 import json
+import hashlib
 import re
 import subprocess
 import sys
@@ -30,6 +31,11 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / "%(title)s [%(id)s].%(ext)s")
 
+    rec_id = _extract_rec_id_from_url(url)
+    before = {
+        path.resolve() for path in output_dir.rglob("*")
+        if path.is_file()
+    } if output_dir.exists() else set()
     cmd = [
         sys.executable, "-m", "yt_dlp",
         url,
@@ -41,8 +47,13 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False)
         "--retries", "3",
         "--fragment-retries", "3",
         "--no-warnings",
-        "--download-archive", str(archive_path),
     ]
+
+    # A stale archive entry must not suppress repair of a missing video.
+    if skip_video:
+        cmd.extend(["--download-archive", str(archive_path)])
+    else:
+        cmd.extend(["--no-download-archive"])
 
     if skip_video:
         cmd.append("--skip-download")
@@ -58,13 +69,28 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False)
             encoding="utf-8", errors="replace", timeout=600,
         )
         if result.returncode == 0:
-            # yt-dlp con --skip-download no escribe al archive, hacerlo manualmente
-            if skip_video and not dry_run:
-                rec_id = _extract_rec_id_from_url(url)
+            if dry_run:
+                return "ok"
+            if skip_video:
+                return "ok" if any(
+                    path.is_file() and path.suffix.lower() in {".vtt", ".srt"}
+                    and path.resolve() not in before
+                    for path in output_dir.rglob("*")
+                ) else "error"
+            produced = [
+                path for path in output_dir.rglob("*")
+                if path.is_file() and path.resolve() not in before
+                and path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+                and path.stat().st_size > 0
+            ]
+            # --no-download-archive avoids stale skips; record successful repairs
+            # only after the requested video is verified on disk.
+            if produced:
                 if rec_id and not is_downloaded(archive_path, rec_id):
-                    with open(archive_path, "a", encoding="utf-8") as f:
-                        f.write(f"zoomus {rec_id}\n")
-            return "ok"
+                    with open(archive_path, "a", encoding="utf-8") as archive:
+                        archive.write(f"zoom {rec_id}\n")
+                return "ok"
+            return "error"
         # Zoom aún procesando o página no disponible
         stderr = result.stderr or ""
         if "Unable to extract" in stderr or "is not a valid URL" in stderr:
@@ -336,7 +362,13 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
             class_number = _class_number_from_filename(vtt_file.name)
             if class_number:
                 category = _class_category_from_filename(vtt_file.name)
-                meta = class_map.get((course_slug, category, class_number), {})
+                candidates = [
+                    candidate for rec_id_key, candidate in id_map.items()
+                    if candidate["slug"] == course_slug
+                    and candidate["class_category"] == category
+                    and candidate["class_number"] == class_number
+                ]
+                meta = candidates[0] if len(candidates) == 1 else {}
         if rec_id and not meta:
             return
 
@@ -492,7 +524,9 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                 sources[whisper_transcript] = ".whisper.transcript.vtt"
 
             for source in course_dir.rglob("*"):
-                if source.is_file() and f"[{rec_id}]" in source.name and source not in sources:
+                if not source.is_file() or source in sources or ".claude-udea-backup" in source.parts:
+                    continue
+                if f"[{rec_id}" in source.name:
                     sources[source] = _filename_suffix(source.name, rec_id)
 
             if not sources and not already_organized:
@@ -507,6 +541,15 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                 category = _recording_category(source.name, suffix, source)
                 target_dir = course_dir / category if category else source.parent
                 destination = target_dir / recording_filename(meta, suffix)
+                if destination.exists() and source != destination:
+                    same, digest = _files_identical(source, destination)
+                    if same:
+                        _backup_duplicate(course_dir, source, rec_id, digest)
+                        organized_files.append(destination.relative_to(course_dir).as_posix())
+                        continue
+                    if category == "videos":
+                        part_number = _next_part_number(target_dir, destination)
+                        destination = target_dir / f"{destination.stem} - Parte {part_number}{destination.suffix}"
                 plans.append((source, destination, rec_id, rec_info, organized_files))
 
         source_paths = {source for source, _, _, _, _ in plans}
@@ -524,9 +567,8 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                 while destination in reserved_destinations or (
                     destination.exists() and destination not in source_paths
                 ):
-                    duplicate_tag = f" ({duplicate_number})"
                     destination = destination.with_name(
-                        f"{base_name}{duplicate_tag}{suffix}"
+                        f"{base_name} - Parte {duplicate_number}{suffix}"
                     )
                     duplicate_number += 1
             reserved_destinations.add(destination)
@@ -565,8 +607,7 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                 print(f"  ⚠ Error renombrando {temporary.name}: {e}")
 
         for rec_id, (rec_info, organized_files) in record_files.items():
-            if organized_files:
-                rec_info["organized_files"] = organized_files
+            rec_info["organized_files"] = sorted(set(organized_files))
 
         _sweep_unclassified(course_dir)
 
@@ -618,51 +659,57 @@ def _sweep_unclassified(course_dir: Path) -> None:
         entry.rename(destination)
 
 
-_LEGACY_TAG_RE = re.compile(
-    r"^(?P<prefix>(?:Fabrica Escuela - )?Clase #\d+ - (?:\d{4}-\d{2}-\d{2}|sin-fecha))"
-    r"(?: \[[^\]]+\])+(?P<suffix>.*)$",
-    re.IGNORECASE,
-)
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def cleanup_legacy_duplicate_names(download_dir: Path, recordings: dict) -> int:
-    """Renombra archivos con tags viejos [rec_id] / [rec_id copy N] a nombres limpios."""
-    cleaned = 0
+def _files_identical(left: Path, right: Path) -> tuple[bool, str]:
+    try:
+        if left.stat().st_size != right.stat().st_size:
+            return False, ""
+        left_hash = _file_sha256(left)
+        right_hash = _file_sha256(right)
+        return left_hash == right_hash, left_hash if left_hash == right_hash else ""
+    except OSError:
+        return False, ""
 
-    for slug in recordings:
-        course_dir = download_dir / slug
-        if not course_dir.is_dir():
-            continue
 
-        for entry in course_dir.rglob("*"):
-            if not entry.is_file():
-                continue
-            match = _LEGACY_TAG_RE.match(entry.name)
-            if not match:
-                continue
+def _backup_duplicate(course_dir: Path, source: Path, rec_id: str, digest: str) -> Path:
+    backup_dir = course_dir / ".claude-udea-backup" / "identical-videos"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    destination = backup_dir / source.name
+    number = 1
+    while destination.exists():
+        if _files_identical(source, destination)[0]:
+            source.unlink()
+            return destination
+        destination = backup_dir / f"{source.stem} ({number}){source.suffix}"
+        number += 1
+    manifest_path = backup_dir / "manifest.jsonl"
+    entry = {
+        "source": source.relative_to(course_dir).as_posix(),
+        "backup": destination.relative_to(course_dir).as_posix(),
+        "recording_id": rec_id,
+        "sha256": digest,
+    }
+    with manifest_path.open("a", encoding="utf-8") as manifest:
+        manifest.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    source.replace(destination)
+    return destination
 
-            clean_name = match.group("prefix") + match.group("suffix")
-            clean_path = entry.with_name(clean_name)
 
-            if clean_path.exists():
-                dup_number = 1
-                while True:
-                    dup_tag = f" ({dup_number})"
-                    dup_name = match.group("prefix") + dup_tag + match.group("suffix")
-                    dup_path = entry.with_name(dup_name)
-                    if not dup_path.exists():
-                        clean_path = dup_path
-                        break
-                    dup_number += 1
-
-            try:
-                entry.rename(clean_path)
-                cleaned += 1
-                print(f"  > {entry.relative_to(course_dir).as_posix()} -> {clean_path.relative_to(course_dir).as_posix()}")
-            except OSError:
-                pass
-
-    return cleaned
+def _next_part_number(folder: Path, destination: Path) -> int:
+    pattern = re.compile(rf"^{re.escape(destination.stem)} - Parte (\d+){re.escape(destination.suffix)}$", re.I)
+    existing = [
+        int(match.group(1))
+        for path in folder.iterdir()
+        if (match := pattern.match(path.name))
+    ]
+    return max(existing, default=0) + 1
 
 
 def backfill_recording_metadata(course_dir: Path, course: dict, links: list[dict]) -> int:

@@ -39,8 +39,11 @@ Todo en un solo comando: `claude_udea`
 - **Setup interactivo** -- la primera vez te guia para configurar tus asignaturas
 - **Asistentes flexibles** -- Claude Code, Gemini CLI, chat local con Ollama o modo sin asistente
 - **Sesión persistente** -- restaura la sesión de Moodle y puede volver a iniciar sesión automáticamente
-- **Descarga incremental** -- nunca re-descarga lo que ya tenes
-- **Deduplicacion inteligente** -- identifica grabaciones por fecha, sin duplicados
+- **Descarga incremental** -- verifica en disco que el video exista antes de omitir una descarga
+- **Paginación Moodle** -- recorre todas las páginas del listado de grabaciones de una actividad
+- **Deduplicacion por contenido** -- compara SHA-256 y respalda copias idénticas en vez de borrarlas
+- **Recuperación de videos faltantes** -- re-descarga un video ausente aunque el registro o el archive lo marquen como descargado
+- **Partes reales** -- conserva videos distintos de una misma sesión como `Clase #N - fecha - Parte M.mp4`
 - **Numeración independiente** -- Arquitectura de Software y Fábrica Escuela tienen secuencias separadas
 - **Transcripción local opcional** -- faster-whisper procesa grabaciones sin subtítulos de Zoom
 - **Cross-platform** -- funciona en Windows, macOS y Linux (incluido Raspberry Pi headless)
@@ -290,6 +293,9 @@ C:\claude-udea\                   # Windows
 |       +-- taller.md
 +-- downloads/
     |-- calidad-de-software/      # Archivos descargados por asignatura
+    |   |-- videos/               # Videos organizados por clase
+    |   +-- .claude-udea-backup/  # Copias idénticas respaldadas (SHA-256)
+    |       +-- identical-videos/ # Contenido duplicado + manifest.jsonl
     |-- ingenieria-web/
     +-- transcripts/              # Transcripciones organizadas
         |-- index.json            # Indice por fecha y asignatura
@@ -301,6 +307,8 @@ C:\claude-udea\                   # Windows
 ```
 
 Las credenciales y cookies no se guardan como archivos en claro: se almacenan en el almacén seguro del sistema operativo. Los nombres de grabaciones incluyen número y fecha; Arquitectura de Software y Fábrica Escuela mantienen secuencias independientes. `downloads/transcripts/index.json` contiene metadata por asignatura.
+
+Cuando el organizador encuentra videos idénticos (mismo tamaño y hash SHA-256), mueve las copias a `downloads/<curso>/.claude-udea-backup/identical-videos/` y registra origen, destino y hash en un `manifest.jsonl`, en vez de borrarlas. Los videos de una misma sesión con contenido distinto se conservan como `Clase #N - fecha - Parte M.mp4`.
 
   ## Transcribir grabaciones sin subtítulos
 
@@ -336,9 +344,9 @@ Las credenciales y cookies no se guardan como archivos en claro: se almacenan en
 ```
 
 1. **Login**: POST directo con usuario y contraseña, sin navegador. La sesión y las credenciales para re-login se guardan localmente.
-2. **Scraping**: Moodle e Ingenia se recorren por sus secciones autenticadas para encontrar documentos, páginas y carpetas. Las listas de grabaciones Zoom se siguen obteniendo desde las páginas de cada plataforma.
-3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) y, si se solicita, videos. El pipeline descarga en paralelo y añade metadata a los VTT.
-4. **Organización**: se asigna numeración secuencial independiente a Arquitectura de Software y Fábrica Escuela, y se regenera el índice por asignatura.
+2. **Scraping**: Moodle e Ingenia se recorren por sus secciones autenticadas para encontrar documentos, páginas y carpetas. Las listas de grabaciones Zoom se obtienen desde las páginas de cada plataforma; en Moodle se siguen los enlaces de paginación de la misma actividad para no perder grabaciones cuando el listado ocupa varias páginas.
+3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) y, si se solicita, videos. El pipeline descarga en paralelo y añade metadata a los VTT. Antes de omitir una grabación se comprueba que el video exista en disco; los videos faltantes se vuelven a descargar aunque el archive los marcara como ya procesados.
+4. **Organización**: se asigna numeración secuencial independiente a Arquitectura de Software y Fábrica Escuela, se regenera el índice por asignatura y se deduplican por contenido (SHA-256) los videos idénticos, respaldándolos sin borrarlos y conservando las partes reales con el sufijo ` - Parte N`.
 5. **Asistente**: Claude Code y Gemini CLI usan las instrucciones generadas. Ollama ofrece un chat local con acceso al índice y a los VTT que se carguen con `/leer`.
 6. **Material Moodle**: los archivos se descargan en `course-materials/` con manifiestos de origen, tamaño y hash. Las entregas de estudiantes no se recopilan.
 
@@ -380,14 +388,10 @@ Usa un entorno virtual (ver seccion de instalacion arriba).
 Es normal que expire despues de varias horas. Al ejecutar `claude_udea` de nuevo, te pedira credenciales solo si es necesario.
 
 ### "Se descargan grabaciones duplicadas"
-Esto se corrigio automaticamente. Si tenes datos viejos, borra `recordings.json` y ejecuta de nuevo:
-```bash
-# Windows
-del C:\claude-udea\recordings.json
 
-# macOS/Linux
-rm ~/claude-udea/recordings.json
-```
+El organizador deduplica los videos por contenido (SHA-256) y respalda las copias idénticas en `downloads/<curso>/.claude-udea-backup/identical-videos/`, sin borrarlas. Los videos de una misma sesión con contenido distinto se conservan con el sufijo ` - Parte N`.
+
+Si tenes archivos viejos con nombres tipo `[rec_id]` o `[rec_id copy N]`, una ejecución normal (`claude_udea --no-assistant <curso>`) los renombra a la convención `Clase #N - fecha` y actualiza `recordings.json`.
 
 ### Resetear todo
 ```bash

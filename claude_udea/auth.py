@@ -10,7 +10,7 @@ import os
 import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -334,73 +334,106 @@ def _scrape_ingenia(session: requests.Session, slug: str,
     return slug, links
 
 
+def _moodle_recording_pages(session: requests.Session, initial_url: str) -> list[str]:
+    """Collect Moodle pages by following pager links on the same activity."""
+    pending = [initial_url]
+    visited = set()
+    pages = []
+    base = urlparse(initial_url)
+    activity_id = re.search(r"[?&]id=(\d+)", initial_url)
+
+    while pending:
+        url = pending.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        try:
+            response = session.get(url, timeout=30)
+            response.raise_for_status()
+        except Exception as error:
+            raise RuntimeError(f"No se pudo leer la página Moodle {url}: {error}") from error
+        if "login" in response.url.lower():
+            raise PermissionError("Sesión expirada al recorrer las páginas de grabaciones Moodle.")
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        pages.append(soup)
+        for anchor in soup.select("a[href]"):
+            href = urljoin(response.url, anchor.get("href", ""))
+            parsed = urlparse(href)
+            href_id = re.search(r"[?&]id=(\d+)", href)
+            if (
+                parsed.scheme not in ("http", "https")
+                or parsed.hostname != base.hostname
+                or parsed.path != base.path
+                or (activity_id and (not href_id or href_id.group(1) != activity_id.group(1)))
+                or href in visited
+            ):
+                continue
+            label = " ".join((anchor.get_text(" ", strip=True), anchor.get("aria-label", ""), anchor.get("title", ""))).casefold()
+            classes = " ".join(anchor.get("class", [])).casefold()
+            parent_classes = " ".join(anchor.parent.get("class", [])).casefold() if anchor.parent else ""
+            is_pager = (
+                "pagination" in parent_classes
+                or "pagination" in classes
+                or label in {"siguiente", "next", "»", "›", "→"}
+                or "siguiente" in label
+                or "next" == label
+            )
+            if is_pager:
+                pending.append(href)
+
+    return pages
+
+
 def _scrape_one(session: requests.Session, slug: str, course_info: dict) -> tuple[str, list[dict]]:
     """Scrapea una materia. Diseñado para correr en un thread."""
     url = course_info["moodle_url"]
     if urlparse(url).hostname == "ingenia.udea.edu.co":
         return _scrape_ingenia(session, slug, course_info)
 
-    try:
-        r = session.get(url, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"  ⚠ Error accediendo a {course_info['name']}: {e}")
-        return slug, []
-
-    # Verificar que no nos redirigió al login
-    if "login" in r.url.lower():
-        print(f"  ⚠ Sesión expirada al acceder a {course_info['name']}")
-        return slug, []
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    table = soup.find("table", class_="generaltable")
-    if not table:
-        return slug, []
-
-    tbody = table.find("tbody")
-    if not tbody:
-        return slug, []
-
     links = []
     seen = set()
-
-    for row in tbody.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 4:
-            continue
-
-        meeting_id = cells[0].get_text(strip=True)
-        topic = cells[1].get_text(strip=True)
-        start_date = cells[2].get_text(strip=True)
-        duration = cells[3].get_text(strip=True)
-
-        hidden_input = row.find("input", {"name": "zoomplayredirect"})
-        if not hidden_input:
-            # Grabación visible en Moodle pero sin URL (aún procesándose en Zoom)
-            print(f"  ⚠ {course_info['name']}: grabación del {start_date} sin URL (procesándose en Zoom)")
-            continue
-
-        href = hidden_input.get("value", "")
-        if not href:
-            print(f"  ⚠ {course_info['name']}: grabación del {start_date} con URL vacía")
-            continue
-
-        match = re.search(r"/rec/(?:share|play)/([^?\s]+)", href)
-        rec_id = match.group(1) if match else href
-        if rec_id in seen:
-            continue
-        seen.add(rec_id)
-
-        links.append({
-            "url": href.split("?")[0],
-            "full_url": href,
-            "text": topic or meeting_id,
-            "id": rec_id,
-            "meeting_id": meeting_id,
-            "topic": topic,
-            "start_date": start_date,
-            "duration_minutes": int(duration) if duration.isdigit() else 0,
-        })
+    try:
+        page_soups = _moodle_recording_pages(session, url)
+        for soup in page_soups:
+            for table in soup.find_all("table", class_="generaltable"):
+                tbody = table.find("tbody")
+                if not tbody:
+                    continue
+                for row in tbody.find_all("tr"):
+                    cells = row.find_all("td")
+                    if len(cells) < 4:
+                        continue
+                    meeting_id = cells[0].get_text(strip=True)
+                    topic = cells[1].get_text(strip=True)
+                    start_date = cells[2].get_text(strip=True)
+                    duration = cells[3].get_text(strip=True)
+                    hidden_input = row.find("input", {"name": "zoomplayredirect"})
+                    if not hidden_input:
+                        print(f"  ⚠ {course_info['name']}: grabación del {start_date} sin URL (procesándose en Zoom)")
+                        continue
+                    href = hidden_input.get("value", "")
+                    if not href:
+                        print(f"  ⚠ {course_info['name']}: grabación del {start_date} con URL vacía")
+                        continue
+                    match = re.search(r"/rec/(?:share|play)/([^?\s]+)", href)
+                    rec_id = match.group(1) if match else href
+                    if rec_id in seen:
+                        continue
+                    seen.add(rec_id)
+                    links.append({
+                        "url": href.split("?")[0],
+                        "full_url": href,
+                        "text": topic or meeting_id,
+                        "id": rec_id,
+                        "meeting_id": meeting_id,
+                        "topic": topic,
+                        "start_date": start_date,
+                        "duration_minutes": int(duration) if duration.isdigit() else 0,
+                    })
+    except Exception as error:
+        print(f"  ⚠ {course_info['name']}: scrape incompleto; no se procesarán páginas parciales: {error}")
+        return slug, []
 
     return slug, links
 

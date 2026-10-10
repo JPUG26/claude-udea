@@ -9,7 +9,6 @@ from claude_udea.download import (
     _class_filename,
     _filename_suffix,
     _recording_category,
-    cleanup_legacy_duplicate_names,
     copy_transcripts,
     rename_downloads,
 )
@@ -362,33 +361,51 @@ class CleanupLegacyNamesTests(unittest.TestCase):
         self.download_dir = Path(self._temporary.name)
         self.course_dir = self.download_dir / "arquitectura-de-software"
         self.course_dir.mkdir(parents=True)
-        self.recordings = {
-            "arquitectura-de-software": {
-                "name": "Arquitectura de Software",
-                "recordings": {},
-            },
-        }
 
     def tearDown(self):
         self._temporary.cleanup()
 
+    def _recordings(self, rec_id, title, start_date, organized_files=None):
+        return {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {
+                    rec_id: {
+                        "title": title,
+                        "start_date": start_date,
+                        "organized_files": organized_files or [],
+                    },
+                },
+            },
+        }
+
     def test_removes_simple_rec_id_tag(self):
         legacy = self.course_dir / "Clase #1 - 2026-09-01 [rec123].mp4"
         legacy.write_bytes(b"video")
+        recordings = self._recordings(
+            "rec123", "Arquitectura de Software", "2026-09-01T10:00:00Z"
+        )
 
-        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+        rename_downloads(self.download_dir, recordings)
 
         self.assertFalse(legacy.exists())
-        self.assertTrue((self.course_dir / "Clase #1 - 2026-09-01.mp4").is_file())
+        self.assertTrue(
+            (self.course_dir / "videos" / "Clase #1 - 2026-09-01.mp4").is_file()
+        )
 
     def test_removes_copy_tag(self):
         legacy = self.course_dir / "Clase #1 - 2026-09-01 [rec123 copy 2].mp4"
         legacy.write_bytes(b"video")
+        recordings = self._recordings(
+            "rec123", "Arquitectura de Software", "2026-09-01T10:00:00Z"
+        )
 
-        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+        rename_downloads(self.download_dir, recordings)
 
         self.assertFalse(legacy.exists())
-        self.assertTrue((self.course_dir / "Clase #1 - 2026-09-01.mp4").is_file())
+        self.assertTrue(
+            (self.course_dir / "videos" / "Clase #1 - 2026-09-01.mp4").is_file()
+        )
 
     def test_handles_fabrica_escuela_prefix(self):
         legacy = (
@@ -396,40 +413,62 @@ class CleanupLegacyNamesTests(unittest.TestCase):
             / "Fabrica Escuela - Clase #1 - 2026-08-26 [factory-3 copy 2].transcript.vtt"
         )
         legacy.write_text("WEBVTT\n", encoding="utf-8")
+        recordings = self._recordings(
+            "factory-3", "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA", "2026-08-26T10:59:13Z"
+        )
 
-        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+        rename_downloads(self.download_dir, recordings)
 
         self.assertFalse(legacy.exists())
         self.assertTrue(
             (
                 self.course_dir
+                / "transcripts" / "zoom"
                 / "Fabrica Escuela - Clase #1 - 2026-08-26.transcript.vtt"
             ).is_file()
         )
 
     def test_avoids_collision_when_clean_name_exists(self):
-        clean = self.course_dir / "Clase #1 - 2026-09-01.mp4"
+        clean = self.course_dir / "videos" / "Clase #1 - 2026-09-01.mp4"
+        clean.parent.mkdir(parents=True)
         clean.write_bytes(b"original")
         legacy = self.course_dir / "Clase #1 - 2026-09-01 [rec123 copy 2].mp4"
         legacy.write_bytes(b"duplicate")
+        recordings = self._recordings(
+            "rec123",
+            "Arquitectura de Software",
+            "2026-09-01T10:00:00Z",
+            organized_files=["videos/Clase #1 - 2026-09-01.mp4"],
+        )
 
-        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+        rename_downloads(self.download_dir, recordings)
 
         self.assertTrue(clean.is_file())
+        self.assertEqual(clean.read_bytes(), b"original")
         self.assertFalse(legacy.exists())
-        self.assertTrue((self.course_dir / "Clase #1 - 2026-09-01 (1).mp4").is_file())
+        self.assertTrue(
+            (self.course_dir / "videos" / "Clase #1 - 2026-09-01 - Parte 1.mp4").is_file()
+        )
 
     def test_skips_files_without_legacy_tags(self):
-        clean = self.course_dir / "Clase #1 - 2026-09-01.mp4"
+        clean = self.course_dir / "videos" / "Clase #1 - 2026-09-01.mp4"
+        clean.parent.mkdir(parents=True)
         clean.write_bytes(b"video")
+        recordings = self._recordings(
+            "rec123",
+            "Arquitectura de Software",
+            "2026-09-01T10:00:00Z",
+            organized_files=["videos/Clase #1 - 2026-09-01.mp4"],
+        )
 
-        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+        rename_downloads(self.download_dir, recordings)
 
         self.assertTrue(clean.is_file())
+        self.assertEqual(clean.read_bytes(), b"video")
 
 
 class DuplicateTagFormatTests(unittest.TestCase):
-    def test_rename_downloads_uses_parenthesis_tags_for_duplicates(self):
+    def test_rename_downloads_labels_distinct_duplicates_as_parts(self):
         recordings = {
             "arquitectura-de-software": {
                 "name": "Arquitectura de Software",
@@ -461,7 +500,7 @@ class DuplicateTagFormatTests(unittest.TestCase):
             )
 
             self.assertIn("videos/Clase #1 - 2026-09-01.mp4", organized)
-            self.assertIn("videos/Clase #1 - 2026-09-01 (1).mp4", organized)
+            self.assertIn("videos/Clase #1 - 2026-09-01 - Parte 1.mp4", organized)
             self.assertFalse(duplicate.exists())
 
     def test_rename_downloads_preserves_cleanly_named_files_on_rerun(self):
@@ -498,6 +537,101 @@ class DuplicateTagFormatTests(unittest.TestCase):
             videos = list(videos_dir.iterdir())
             self.assertEqual(len(videos), 1)
             self.assertEqual(videos[0].name, "Clase #1 - 2026-09-01.mp4")
+
+
+class VideoDuplicateSafetyTests(unittest.TestCase):
+    def test_backups_only_byte_identical_video_and_keeps_distinct_content_as_part(self):
+        recordings = {
+            "arquitectura-de-software": {
+                "recordings": {
+                    "rec-1": {
+                        "title": "Arquitectura de Software",
+                        "start_date": "2026-09-01T10:00:00Z",
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "arquitectura-de-software"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            (videos / "Clase #1 - 2026-09-01.mp4").write_bytes(b"same")
+            duplicate = course_dir / "Clase #1 - 2026-09-01 [rec-1 copy 2].mp4"
+            duplicate.write_bytes(b"same")
+            distinct = course_dir / "Clase #1 - 2026-09-01 [rec-1 copy 3].mp4"
+            distinct.write_bytes(b"part two")
+            recordings["arquitectura-de-software"]["recordings"]["rec-1"][
+                "organized_files"
+            ] = [
+                "videos/Clase #1 - 2026-09-01.mp4",
+                duplicate.name,
+                distinct.name,
+            ]
+
+            rename_downloads(download_dir, recordings)
+
+            canonical = videos / "Clase #1 - 2026-09-01.mp4"
+            part = videos / "Clase #1 - 2026-09-01 - Parte 1.mp4"
+            backup = course_dir / ".claude-udea-backup" / "identical-videos" / duplicate.name
+            self.assertEqual(canonical.read_bytes(), b"same")
+            self.assertTrue(backup.is_file())
+            self.assertEqual(part.read_bytes(), b"part two")
+            self.assertIn("videos/Clase #1 - 2026-09-01 - Parte 1.mp4", recordings[
+                "arquitectura-de-software"]["recordings"]["rec-1"]["organized_files"])
+
+
+class RecordingMergeTests(unittest.TestCase):
+    def test_keeps_distinct_recording_ids_with_same_date_and_category(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {}
+        config = {
+            "download_dir": ".",
+            "courses": {"architecture": {"name": "Architecture"}},
+        }
+        links = [
+            {
+                "url": f"https://zoom.example/rec/share/{rec_id}",
+                "full_url": f"https://zoom.example/rec/share/{rec_id}",
+                "text": title,
+                "topic": title,
+                "start_date": "2026-09-01T10:00:00Z",
+                "duration_minutes": 60,
+            }
+            for rec_id, title in (("rec-1", "Architecture"), ("rec-2", "Architecture"))
+        ]
+
+        pending = _merge_scraped(existing, config, "architecture", links)
+
+        self.assertEqual(set(existing["architecture"]["recordings"]), {"rec-1", "rec-2"})
+        self.assertEqual({item[1] for item in pending}, {"rec-1", "rec-2"})
+
+    def test_duplicate_id_in_one_scrape_is_queued_once(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {}
+        config = {"download_dir": ".", "courses": {"architecture": {"name": "Architecture"}}}
+        link = {
+            "url": "https://zoom.example/rec/share/rec-1",
+            "full_url": "https://zoom.example/rec/share/rec-1",
+            "text": "Architecture",
+            "topic": "Architecture",
+            "start_date": "2026-09-01T10:00:00Z",
+            "duration_minutes": 60,
+        }
+
+        pending = _merge_scraped(existing, config, "architecture", [link, link])
+
+        self.assertEqual(len(pending), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":
