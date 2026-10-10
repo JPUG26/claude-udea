@@ -41,6 +41,9 @@ Todo en un solo comando: `claude_udea`
 - **Sesión persistente** -- restaura la sesión de Moodle y puede volver a iniciar sesión automáticamente
 - **Descarga incremental** -- verifica en disco que el video exista antes de omitir una descarga
 - **Paginación Moodle** -- recorre todas las páginas del listado de grabaciones de una actividad
+- **Filtro por fechas** -- recorre el listado de Moodle por ventanas de 30 días para no perder las grabaciones antiguas (el listado oculta por defecto las de hace meses)
+- **Descarga de chat** -- obtiene el archivo de chat de cada grabación desde la página `/rec/share/` y lo guarda en `chat/`
+- **Subtítulos sin re-descargar** -- al reparar un video faltante no vuelve a bajar los subtítulos que ya están organizados
 - **Deduplicacion por contenido** -- compara SHA-256 y respalda copias idénticas en vez de borrarlas
 - **Recuperación de videos faltantes** -- re-descarga un video ausente aunque el registro o el archive lo marquen como descargado
 - **Partes reales** -- conserva videos distintos de una misma sesión como `Clase #N - fecha - Parte M.mp4`
@@ -223,7 +226,7 @@ claude_udea --sync-ingenia-materials "https://ingenia.udea.edu.co/campus/course/
 claude_udea --always-whisper --skip-video # Crear VTT con faster-whisper
 ```
 
-En cada carpeta `downloads/<curso>/` los archivos se separan en `videos/`, `transcripts/zoom/`, `transcripts/whisper/` y `chat/`. Los archivos de chat se organizan allí si la descarga/plataforma los proporciona; Zoom no siempre expone un archivo de chat descargable.
+En cada carpeta `downloads/<curso>/` los archivos se separan en `videos/`, `transcripts/zoom/`, `transcripts/whisper/` y `chat/`. El archivo de chat se descarga desde la página `/rec/share/` de cada grabación y se guarda en `chat/` con el nombre `Clase #N - fecha.chat.txt`; Zoom no siempre expone un chat descargable.
 
 El comando de Ingenia solicita usuario y contraseña directamente en la terminal si no existe una sesión válida. Los datos se guardan separados de Moodle en Windows Credential Manager. La cuenta debe estar matriculada en el curso; el scraper no intenta comprar ni matricularse.
 
@@ -344,9 +347,9 @@ Cuando el organizador encuentra videos idénticos (mismo tamaño y hash SHA-256)
 ```
 
 1. **Login**: POST directo con usuario y contraseña, sin navegador. La sesión y las credenciales para re-login se guardan localmente.
-2. **Scraping**: Moodle e Ingenia se recorren por sus secciones autenticadas para encontrar documentos, páginas y carpetas. Las listas de grabaciones Zoom se obtienen desde las páginas de cada plataforma; en Moodle se siguen los enlaces de paginación de la misma actividad para no perder grabaciones cuando el listado ocupa varias páginas.
-3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) y, si se solicita, videos. El pipeline descarga en paralelo y añade metadata a los VTT. Antes de omitir una grabación se comprueba que el video exista en disco; los videos faltantes se vuelven a descargar aunque el archive los marcara como ya procesados.
-4. **Organización**: se asigna numeración secuencial independiente a Arquitectura de Software y Fábrica Escuela, se regenera el índice por asignatura y se deduplican por contenido (SHA-256) los videos idénticos, respaldándolos sin borrarlos y conservando las partes reales con el sufijo ` - Parte N`.
+2. **Scraping**: Moodle e Ingenia se recorren por sus secciones autenticadas para encontrar documentos, páginas y carpetas. Las listas de grabaciones Zoom se obtienen desde las páginas de cada plataforma; en Moodle se aplica el filtro por rango de fechas (ventanas de 30 días) y se siguen los enlaces de paginación de la misma actividad, para no perder grabaciones antiguas ni las de listados que ocupan varias páginas.
+3. **Descarga**: yt-dlp descarga transcripciones (`.vtt`) y, si se solicita, videos. El pipeline descarga en paralelo y añade metadata a los VTT. Antes de omitir una grabación se comprueba que el video exista en disco; los videos faltantes se vuelven a descargar aunque el archive los marcara como ya procesados, sin re-descargar los subtítulos ya existentes. Además se descarga el archivo de chat desde la página `/rec/share/` de cada grabación.
+4. **Organización**: se asigna numeración secuencial independiente a Arquitectura de Software y Fábrica Escuela, se regenera el índice por asignatura y se deduplican por contenido (SHA-256) los videos idénticos, respaldándolos sin borrarlos y conservando las partes reales con el sufijo ` - Parte N`. Los subtítulos sueltos se mueven a `transcripts/zoom/` o `transcripts/whisper/`, y los chats a `chat/`.
 5. **Asistente**: Claude Code y Gemini CLI usan las instrucciones generadas. Ollama ofrece un chat local con acceso al índice y a los VTT que se carguen con `/leer`.
 6. **Material Moodle**: los archivos se descargan en `course-materials/` con manifiestos de origen, tamaño y hash. Las entregas de estudiantes no se recopilan.
 
