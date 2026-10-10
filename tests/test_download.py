@@ -7,7 +7,9 @@ from pathlib import Path
 from claude_udea.download import (
     _build_rec_id_map,
     _class_filename,
+    _filename_suffix,
     _recording_category,
+    cleanup_legacy_duplicate_names,
     copy_transcripts,
     rename_downloads,
 )
@@ -315,6 +317,187 @@ class RecordingsStoreTests(unittest.TestCase):
             loaded = load_recordings(path)
 
         self.assertEqual(set(loaded["arquitectura-de-software"]["recordings"]), {"class-1", "factory-1"})
+
+
+class FilenameSuffixTests(unittest.TestCase):
+    def test_extracts_suffix_after_rec_id_bracket(self):
+        self.assertEqual(
+            _filename_suffix("Clase [rec123].mp4", "rec123"),
+            ".mp4",
+        )
+        self.assertEqual(
+            _filename_suffix("Titulo [recording-1].transcript.vtt", "recording-1"),
+            ".transcript.vtt",
+        )
+
+    def test_extracts_suffix_after_rec_id_with_copy_tag(self):
+        self.assertEqual(
+            _filename_suffix(
+                "Clase #1 - 2026-09-01 [rec123 copy 2].mp4", "rec123"
+            ),
+            ".mp4",
+        )
+        self.assertEqual(
+            _filename_suffix(
+                "Fabrica Escuela - Clase #1 - 2026-08-26 [factory-3 copy 2].whisper.transcript.vtt",
+                "factory-3",
+            ),
+            ".whisper.transcript.vtt",
+        )
+
+    def test_extracts_suffix_from_clean_filename_without_brackets(self):
+        self.assertEqual(
+            _filename_suffix("Clase #1 - 2026-02-01.mp4", ""),
+            ".mp4",
+        )
+        self.assertEqual(
+            _filename_suffix("Clase #1 - 2026-02-01.transcript.vtt", ""),
+            ".transcript.vtt",
+        )
+
+
+class CleanupLegacyNamesTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.download_dir = Path(self._temporary.name)
+        self.course_dir = self.download_dir / "arquitectura-de-software"
+        self.course_dir.mkdir(parents=True)
+        self.recordings = {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {},
+            },
+        }
+
+    def tearDown(self):
+        self._temporary.cleanup()
+
+    def test_removes_simple_rec_id_tag(self):
+        legacy = self.course_dir / "Clase #1 - 2026-09-01 [rec123].mp4"
+        legacy.write_bytes(b"video")
+
+        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+
+        self.assertFalse(legacy.exists())
+        self.assertTrue((self.course_dir / "Clase #1 - 2026-09-01.mp4").is_file())
+
+    def test_removes_copy_tag(self):
+        legacy = self.course_dir / "Clase #1 - 2026-09-01 [rec123 copy 2].mp4"
+        legacy.write_bytes(b"video")
+
+        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+
+        self.assertFalse(legacy.exists())
+        self.assertTrue((self.course_dir / "Clase #1 - 2026-09-01.mp4").is_file())
+
+    def test_handles_fabrica_escuela_prefix(self):
+        legacy = (
+            self.course_dir
+            / "Fabrica Escuela - Clase #1 - 2026-08-26 [factory-3 copy 2].transcript.vtt"
+        )
+        legacy.write_text("WEBVTT\n", encoding="utf-8")
+
+        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+
+        self.assertFalse(legacy.exists())
+        self.assertTrue(
+            (
+                self.course_dir
+                / "Fabrica Escuela - Clase #1 - 2026-08-26.transcript.vtt"
+            ).is_file()
+        )
+
+    def test_avoids_collision_when_clean_name_exists(self):
+        clean = self.course_dir / "Clase #1 - 2026-09-01.mp4"
+        clean.write_bytes(b"original")
+        legacy = self.course_dir / "Clase #1 - 2026-09-01 [rec123 copy 2].mp4"
+        legacy.write_bytes(b"duplicate")
+
+        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+
+        self.assertTrue(clean.is_file())
+        self.assertFalse(legacy.exists())
+        self.assertTrue((self.course_dir / "Clase #1 - 2026-09-01 (1).mp4").is_file())
+
+    def test_skips_files_without_legacy_tags(self):
+        clean = self.course_dir / "Clase #1 - 2026-09-01.mp4"
+        clean.write_bytes(b"video")
+
+        cleanup_legacy_duplicate_names(self.download_dir, self.recordings)
+
+        self.assertTrue(clean.is_file())
+
+
+class DuplicateTagFormatTests(unittest.TestCase):
+    def test_rename_downloads_uses_parenthesis_tags_for_duplicates(self):
+        recordings = {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {
+                    "recording-1": {
+                        "title": "Arquitectura de Software",
+                        "start_date": "2026-09-01T10:00:00Z",
+                    },
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "arquitectura-de-software"
+            videos_dir = course_dir / "videos"
+            videos_dir.mkdir(parents=True)
+
+            (videos_dir / "Clase #1 - 2026-09-01.mp4").write_bytes(b"first")
+            duplicate = course_dir / "Duplicado [recording-1].mp4"
+            duplicate.write_bytes(b"second")
+
+            rename_downloads(download_dir, recordings)
+
+            organized = sorted(
+                path.relative_to(course_dir).as_posix()
+                for path in course_dir.rglob("*")
+                if path.is_file()
+            )
+
+            self.assertIn("videos/Clase #1 - 2026-09-01.mp4", organized)
+            self.assertIn("videos/Clase #1 - 2026-09-01 (1).mp4", organized)
+            self.assertFalse(duplicate.exists())
+
+    def test_rename_downloads_preserves_cleanly_named_files_on_rerun(self):
+        recordings = {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {
+                    "recording-1": {
+                        "title": "Arquitectura de Software",
+                        "start_date": "2026-09-01T10:00:00Z",
+                    },
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "arquitectura-de-software"
+            videos_dir = course_dir / "videos"
+            videos_dir.mkdir(parents=True)
+
+            video_path = videos_dir / "Clase #1 - 2026-09-01.mp4"
+            video_path.write_bytes(b"video")
+
+            recordings["arquitectura-de-software"]["recordings"]["recording-1"][
+                "organized_files"
+            ] = ["videos/Clase #1 - 2026-09-01.mp4"]
+
+            rename_downloads(download_dir, recordings)
+
+            self.assertTrue(video_path.is_file())
+            self.assertEqual(video_path.read_bytes(), b"video")
+
+            videos = list(videos_dir.iterdir())
+            self.assertEqual(len(videos), 1)
+            self.assertEqual(videos[0].name, "Clase #1 - 2026-09-01.mp4")
 
 
 if __name__ == "__main__":

@@ -487,11 +487,12 @@ def _get_assistant(config) -> str:
 
 
 def fase_final(config, recordings, target_courses, assistant_override=None, ollama_model=None):
-    from claude_udea.download import copy_transcripts, count_transcripts, rename_downloads
+    from claude_udea.download import cleanup_legacy_duplicate_names, copy_transcripts, count_transcripts, rename_downloads
 
     download_dir = Path(config["download_dir"])
 
     with Spinner("Organizando transcripciones..."):
+        cleanup_legacy_duplicate_names(download_dir, recordings)
         rename_downloads(download_dir, recordings)
         copy_transcripts(download_dir, recordings)
         save_recordings(Path(config["recordings_file"]), recordings)

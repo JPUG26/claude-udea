@@ -149,9 +149,13 @@ def _datetime_key(value):
 
 def _filename_suffix(filename: str, rec_id: str) -> str:
     """Conserva la extensión y variantes de subtítulo después del ID."""
-    marker = f"[{rec_id}]"
-    if rec_id and marker in filename:
-        return filename.split(marker, 1)[1]
+    if rec_id:
+        marker = re.search(
+            r"\[[^\]]*" + re.escape(rec_id) + r"[^\]]*\]",
+            filename,
+        )
+        if marker:
+            return filename[marker.end():]
     id_suffix = re.search(
         r"\[[^\]]+\](\.(?:whisper\.)?(?:transcript|chapter|cc)\.vtt|\.[^.]+)$",
         filename,
@@ -354,13 +358,12 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
             if not suffix or not new_name.endswith(suffix):
                 suffix = Path(new_name).suffix
             prefix = new_name[:-len(suffix)] if suffix else new_name
-            duplicate_tag = f" [{rec_id}]" if rec_id else " [duplicate]"
-            candidate = course_transcripts / f"{prefix}{duplicate_tag}{suffix}"
-            duplicate_number = 2
-            while candidate.exists():
-                candidate = course_transcripts / (
-                    f"{prefix}{duplicate_tag} {duplicate_number}{suffix}"
-                )
+            duplicate_number = 1
+            while True:
+                duplicate_tag = f" ({duplicate_number})"
+                candidate = course_transcripts / f"{prefix}{duplicate_tag}{suffix}"
+                if not candidate.exists():
+                    break
                 duplicate_number += 1
             dest = candidate
             new_name = dest.name
@@ -464,28 +467,41 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
             if not meta:
                 continue
 
-            sources = dict(loose_sources.get(rec_id, {}))
+            organized_paths = []
             for relative_name in rec_info.get("organized_files", []):
                 source = course_dir / relative_name
                 if source.is_file():
+                    organized_paths.append(source)
+
+            # Archivos ya organizados (sin tag [rec_id] en el nombre): se preservan tal cual.
+            already_organized = [
+                path for path in organized_paths if not _ID_MARKER_RE.search(path.name)
+            ]
+
+            sources = dict(loose_sources.get(rec_id, {}))
+            for source in organized_paths:
+                # Nombres con tags viejos [rec_id] / [rec_id copy N]: re-normalizar.
+                if _ID_MARKER_RE.search(source.name):
                     sources[source] = _filename_suffix(source.name, rec_id)
 
             whisper_transcript = (
                 course_dir / "transcripts" / "whisper"
                 / recording_filename(meta, ".whisper.transcript.vtt")
             )
-            if whisper_transcript.is_file():
+            if whisper_transcript.is_file() and whisper_transcript not in organized_paths:
                 sources[whisper_transcript] = ".whisper.transcript.vtt"
 
             for source in course_dir.rglob("*"):
                 if source.is_file() and f"[{rec_id}]" in source.name and source not in sources:
                     sources[source] = _filename_suffix(source.name, rec_id)
 
-            if not sources:
+            if not sources and not already_organized:
                 # No hay archivos para este recording
                 continue
 
-            organized_files = []
+            organized_files = [
+                path.relative_to(course_dir).as_posix() for path in already_organized
+            ]
             record_files[rec_id] = (rec_info, organized_files)
             for source, suffix in sources.items():
                 category = _recording_category(source.name, suffix, source)
@@ -508,7 +524,7 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
                 while destination in reserved_destinations or (
                     destination.exists() and destination not in source_paths
                 ):
-                    duplicate_tag = f" [{rec_id}]" if duplicate_number == 1 else f" [{rec_id} copy {duplicate_number}]"
+                    duplicate_tag = f" ({duplicate_number})"
                     destination = destination.with_name(
                         f"{base_name}{duplicate_tag}{suffix}"
                     )
@@ -600,6 +616,53 @@ def _sweep_unclassified(course_dir: Path) -> None:
             continue
         target_dir.mkdir(parents=True, exist_ok=True)
         entry.rename(destination)
+
+
+_LEGACY_TAG_RE = re.compile(
+    r"^(?P<prefix>(?:Fabrica Escuela - )?Clase #\d+ - (?:\d{4}-\d{2}-\d{2}|sin-fecha))"
+    r"(?: \[[^\]]+\])+(?P<suffix>.*)$",
+    re.IGNORECASE,
+)
+
+
+def cleanup_legacy_duplicate_names(download_dir: Path, recordings: dict) -> int:
+    """Renombra archivos con tags viejos [rec_id] / [rec_id copy N] a nombres limpios."""
+    cleaned = 0
+
+    for slug in recordings:
+        course_dir = download_dir / slug
+        if not course_dir.is_dir():
+            continue
+
+        for entry in course_dir.rglob("*"):
+            if not entry.is_file():
+                continue
+            match = _LEGACY_TAG_RE.match(entry.name)
+            if not match:
+                continue
+
+            clean_name = match.group("prefix") + match.group("suffix")
+            clean_path = entry.with_name(clean_name)
+
+            if clean_path.exists():
+                dup_number = 1
+                while True:
+                    dup_tag = f" ({dup_number})"
+                    dup_name = match.group("prefix") + dup_tag + match.group("suffix")
+                    dup_path = entry.with_name(dup_name)
+                    if not dup_path.exists():
+                        clean_path = dup_path
+                        break
+                    dup_number += 1
+
+            try:
+                entry.rename(clean_path)
+                cleaned += 1
+                print(f"  > {entry.relative_to(course_dir).as_posix()} -> {clean_path.relative_to(course_dir).as_posix()}")
+            except OSError:
+                pass
+
+    return cleaned
 
 
 def backfill_recording_metadata(course_dir: Path, course: dict, links: list[dict]) -> int:
