@@ -368,6 +368,37 @@ def _recording_video_missing(course_dir: Path, rec_info: dict, rec_id: str) -> b
     return not _has_video_artifact(course_dir, rec_info, rec_id)
 
 
+def _recording_subs_present(course_dir: Path, rec_info: dict) -> bool:
+    """True si ya existen subtítulos (VTT) organizados para esta grabación."""
+    for relative_name in rec_info.get("organized_files", []):
+        if relative_name.lower().endswith(".vtt"):
+            path = course_dir / relative_name
+            try:
+                if path.is_file() and path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+
+    start_date = rec_info.get("start_date", "")
+    date_prefix = start_date[:10] if start_date else ""
+    if not date_prefix or not date_prefix[0].isdigit():
+        return False
+    title = rec_info.get("title", "").casefold()
+    category_prefix = "fabrica escuela - clase #" if (
+        "fabrica de escuela" in title or "fabrica escuela" in title
+    ) else "clase #"
+    date_marker = f" - {date_prefix}"
+    for path in course_dir.rglob("*.vtt"):
+        name = path.name.casefold()
+        if name.startswith(category_prefix) and date_marker in name:
+            try:
+                if path.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, skip_video, dry_run, skip_scrape=False):
     """
     Pipeline paralelo: login → scrape todas las materias en paralelo →
@@ -470,7 +501,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 for item in pending:
                     slug_d, rec_id, rec_info, url = item
                     course_dir = download_dir / slug_d
-                    df = pool.submit(download_one, url, course_dir, archive_path, skip_video, dry_run)
+                    skip_subs = (not skip_video) and _recording_subs_present(course_dir, rec_info)
+                    df = pool.submit(download_one, url, course_dir, archive_path, skip_video, dry_run, skip_subs)
                     download_futures.append((slug_d, rec_id, rec_info, df))
         else:
             # Sin scraping: solo descargar pendientes existentes
@@ -485,7 +517,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                     url = rec_info.get("url") or rec_info.get("share_url", "")
                     if url:
                         course_dir = download_dir / slug
-                        df = pool.submit(download_one, url, course_dir, archive_path, skip_video, dry_run)
+                        skip_subs = (not skip_video) and _recording_subs_present(course_dir, rec_info)
+                        df = pool.submit(download_one, url, course_dir, archive_path, skip_video, dry_run, skip_subs)
                         download_futures.append((slug, rec_id, rec_info, df))
 
         # Esperar descargas con barra de progreso

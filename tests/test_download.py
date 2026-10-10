@@ -3,10 +3,12 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from claude_udea.download import (
     _build_rec_id_map,
     _class_filename,
+    _download_chat,
     _filename_suffix,
     _recording_category,
     copy_transcripts,
@@ -285,7 +287,9 @@ class LooseFileOrganizationTests(unittest.TestCase):
         rename_downloads(self.download_dir, self.recordings)
 
         self.assertFalse(orphan.exists())
-        self.assertTrue((self.course_dir / "sin-clasificar" / orphan.name).is_file())
+        self.assertTrue(
+            (self.course_dir / "transcripts" / "zoom" / orphan.name).is_file()
+        )
 
     def test_file_with_id_and_no_recording_is_swept_not_left_in_root(self):
         stray = self.course_dir / "Algo [unknown-id].mp4"
@@ -624,6 +628,57 @@ class RecordingMergeTests(unittest.TestCase):
         pending = _merge_scraped(existing, config, "architecture", [link, link])
 
         self.assertEqual(len(pending), 1)
+
+
+class ChatDownloadTests(unittest.TestCase):
+    def test_downloads_chat_file_from_share_page(self):
+        share_url = "https://zoom.example/rec/share/abc123"
+        chat_url = "https://zoom.example/rec/chat/abc123_chat.txt"
+        share_html = f'<html><body><a href="{chat_url}">Chat</a></body></html>'
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+
+            def side_effect(url, **kwargs):
+                response = Mock()
+                response.raise_for_status = Mock()
+                response.headers = {}
+                response.url = url
+                if url == share_url:
+                    response.text = share_html
+                    return response
+                if url == chat_url:
+                    response.content = b"chat content"
+                    return response
+                raise AssertionError(f"unexpected url {url}")
+
+            with patch("claude_udea.download.requests.get", side_effect=side_effect):
+                result = _download_chat(share_url, output_dir)
+
+            self.assertTrue(result)
+            chat_file = output_dir / "Recording [abc123].chat.txt"
+            self.assertTrue(chat_file.is_file())
+            self.assertEqual(chat_file.read_bytes(), b"chat content")
+
+    def test_returns_false_when_no_chat_link(self):
+        share_url = "https://zoom.example/rec/share/abc123"
+        share_html = '<html><body><a href="/rec/play/abc123">Ver</a></body></html>'
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+
+            def side_effect(url, **kwargs):
+                response = Mock()
+                response.raise_for_status = Mock()
+                response.headers = {}
+                response.url = url
+                response.text = share_html
+                return response
+
+            with patch("claude_udea.download.requests.get", side_effect=side_effect):
+                result = _download_chat(share_url, output_dir)
+
+            self.assertFalse(result)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from bs4 import BeautifulSoup
+
 from claude_udea import auth
 
 
@@ -124,6 +126,51 @@ class MoodleRecordingPaginationTests(unittest.TestCase):
 
         self.assertEqual(len(links), 1)
         self.assertEqual(session.get.call_count, 1)
+
+
+class MoodleDateWindowTests(unittest.TestCase):
+    def test_detects_date_range_fields(self):
+        soup = BeautifulSoup(
+            '<form method="get"><input name="from" type="date">'
+            '<input name="to" type="date"><input name="sesskey" value="x"></form>',
+            "html.parser",
+        )
+        self.assertEqual(auth._detect_date_range_fields(soup), ("from", "to"))
+
+    def test_scrape_iterates_date_windows(self):
+        initial_url = "https://udearroba.udea.edu.co/internos/mod/recordingszoom/recordinglist.php?id=123"
+
+        def record_page(rec_id):
+            return (
+                '<form method="get"><input name="from" type="date">'
+                '<input name="to" type="date"></form>'
+                '<table class="generaltable"><tbody>'
+                f'<tr><td>m</td><td>T</td><td>2026-08-05</td><td>60</td>'
+                f'<td><input name="zoomplayredirect" value="https://zoom.example/rec/share/{rec_id}"></td></tr>'
+                '</tbody></table>'
+            )
+
+        responses = {
+            initial_url: record_page("rec-0"),
+            auth._append_params(initial_url, {"from": "2026-08-01", "to": "2026-08-30"}): record_page("rec-1"),
+            auth._append_params(initial_url, {"from": "2026-08-31", "to": "2026-09-29"}): record_page("rec-2"),
+        }
+        session = Mock()
+        session.get.side_effect = lambda url, **kwargs: SimpleNamespace(
+            url=url, text=responses[url], raise_for_status=Mock()
+        )
+
+        with patch.object(
+            auth,
+            "_date_windows",
+            return_value=[("2026-08-01", "2026-08-30"), ("2026-08-31", "2026-09-29")],
+        ):
+            slug, links = auth._scrape_one(
+                session, "architecture", {"name": "Architecture", "moodle_url": initial_url}
+            )
+
+        self.assertEqual(slug, "architecture")
+        self.assertEqual([link["id"] for link in links], ["rec-1", "rec-2"])
 
 
 if __name__ == "__main__":

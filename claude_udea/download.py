@@ -13,6 +13,10 @@ import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
 
 
 def get_archive_path(download_dir: Path) -> Path:
@@ -26,7 +30,7 @@ def is_downloaded(archive_path: Path, rec_id: str) -> bool:
     return rec_id in content
 
 
-def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False):
+def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False, skip_subs=False):
     """Descarga una grabación. Retorna 'ok', 'processing' o 'error'."""
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / "%(title)s [%(id)s].%(ext)s")
@@ -36,18 +40,25 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False)
         path.resolve() for path in output_dir.rglob("*")
         if path.is_file()
     } if output_dir.exists() else set()
+
+    # Si los subtítulos ya existen, reparar un video faltante no debe re-descargarlos.
+    write_subs = skip_video or not skip_subs
+
     cmd = [
         sys.executable, "-m", "yt_dlp",
         url,
         "-o", output_template,
-        "--write-subs", "--all-subs",
-        "--sub-format", "vtt/srt/best",
-        "--convert-subs", "vtt",
         "--no-overwrites",
         "--retries", "3",
         "--fragment-retries", "3",
         "--no-warnings",
     ]
+    if write_subs:
+        cmd.extend([
+            "--write-subs", "--all-subs",
+            "--sub-format", "vtt/srt/best",
+            "--convert-subs", "vtt",
+        ])
 
     # A stale archive entry must not suppress repair of a missing video.
     if skip_video:
@@ -71,6 +82,7 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False)
         if result.returncode == 0:
             if dry_run:
                 return "ok"
+            _download_chat(url, output_dir)
             if skip_video:
                 return "ok" if any(
                     path.is_file() and path.suffix.lower() in {".vtt", ".srt"}
@@ -100,6 +112,38 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False)
         return "error"
     except Exception:
         return "error"
+
+
+def _download_chat(url: str, output_dir: Path) -> bool:
+    """Descarga el archivo de chat de una grabación Zoom desde la página /rec/share/."""
+    rec_id = _extract_rec_id_from_url(url)
+    if not rec_id:
+        return False
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        chat_url = None
+        for anchor in soup.select("a[href]"):
+            href = anchor.get("href", "")
+            text = anchor.get_text(" ", strip=True).casefold()
+            if "chat" in href.casefold() or "chat" in text:
+                chat_url = href
+                break
+        if not chat_url:
+            return False
+        if not chat_url.startswith(("http://", "https://")):
+            chat_url = urljoin(response.url, chat_url)
+
+        chat_response = requests.get(chat_url, timeout=60)
+        chat_response.raise_for_status()
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target = output_dir / f"Recording [{rec_id}].chat.txt"
+        target.write_bytes(chat_response.content)
+        return True
+    except Exception:
+        return False
 
 
 def _extract_rec_id_from_url(url: str) -> str:
@@ -645,11 +689,27 @@ _SWEEP_SUFFIXES = {
 
 
 def _sweep_unclassified(course_dir: Path) -> None:
-    """Mueve a sin-clasificar/ los archivos del curso que quedaron en la raíz sin destino."""
+    """Mueve archivos sueltos de la raíz a su carpeta según tipo, o a sin-clasificar."""
     for entry in course_dir.iterdir():
         if not entry.is_file() or entry.suffix.lower() not in _SWEEP_SUFFIXES:
             continue
-        category = "incompletos" if _INCOMPLETE_RE.search(entry.name) else "sin-clasificar"
+        lowered = entry.name.lower()
+        if _INCOMPLETE_RE.search(entry.name):
+            category = "incompletos"
+        elif lowered.endswith(".vtt"):
+            is_whisper = ".whisper.transcript." in lowered
+            if not is_whisper:
+                try:
+                    is_whisper = "generada localmente con faster-whisper" in entry.read_text(
+                        encoding="utf-8", errors="replace"
+                    )[:500]
+                except OSError:
+                    pass
+            category = "transcripts/whisper" if is_whisper else "transcripts/zoom"
+        elif "chat" in entry.name and entry.suffix.lower() in {".txt", ".json", ".vtt", ".csv"}:
+            category = "chat"
+        else:
+            category = "sin-clasificar"
         target_dir = course_dir / category
         destination = target_dir / entry.name
         if destination.exists():
