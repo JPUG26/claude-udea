@@ -47,7 +47,8 @@ class WhisperTranscriptionTests(unittest.TestCase):
 
             def transcribe_side_effect(model, wav, destination, parts_dir):
                 destination.write_text(
-                    "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n\n",
+                    "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n\n"
+                    "1\n00:00:00.000 --> 00:00:01.000\nHola\n",
                     encoding="utf-8",
                 )
 
@@ -122,7 +123,8 @@ class WhisperTranscriptionTests(unittest.TestCase):
 
             def transcribe_side_effect(_model, _wav, destination, _parts_dir):
                 destination.write_text(
-                    "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n",
+                    "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n"
+                    "\n1\n00:00:00.000 --> 00:00:01.000\nHola\n",
                     encoding="utf-8",
                 )
 
@@ -147,7 +149,8 @@ class WhisperTranscriptionTests(unittest.TestCase):
             course_dir.mkdir(parents=True)
             transcript = course_dir / "Clase #1 - 2026-01-01.transcript.vtt"
             transcript.write_text(
-                "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n",
+                "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n"
+                "\n1\n00:00:00.000 --> 00:00:01.000\nHola\n",
                 encoding="utf-8",
             )
             (work_dir / "recordings.json").write_text(
@@ -167,6 +170,56 @@ class WhisperTranscriptionTests(unittest.TestCase):
             result = transcribe_all(work_dir)
 
         self.assertEqual(result, (0, 0))
+
+    def test_header_only_whisper_transcript_is_reprocessed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            course_dir = work_dir / "downloads" / "software-architecture"
+            (course_dir / "transcripts" / "whisper").mkdir(parents=True)
+            empty = course_dir / "transcripts" / "whisper" / "Clase #1 - 2026-01-01.whisper.transcript.vtt"
+            empty.write_text(
+                "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n",
+                encoding="utf-8",
+            )
+            (work_dir / "recordings.json").write_text(
+                json.dumps({
+                    "software-architecture": {
+                        "recordings": {
+                            "recording-123": {
+                                "url": "https://zoom.example/recording-123",
+                                "start_date": "2026-01-01T10:00:00Z",
+                                "organized_files": [f"transcripts/whisper/{empty.name}"],
+                            }
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (course_dir / "Clase [recording-123].mp4").write_bytes(b"video")
+            faster_whisper = ModuleType("faster_whisper")
+            faster_whisper.WhisperModel = Mock(return_value=Mock())
+
+            def extract_audio_side_effect(source, remove_video=True):
+                wav = source.with_suffix(".wav")
+                wav.write_bytes(b"audio")
+                return wav
+
+            def transcribe_side_effect(_model, _wav, destination, _parts_dir):
+                destination.write_text(
+                    "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n",
+                    encoding="utf-8",
+                )
+
+            with (
+                patch.dict("sys.modules", {"faster_whisper": faster_whisper}),
+                patch("transcribe_missing.extract_audio", side_effect=extract_audio_side_effect),
+                patch("transcribe_missing.transcribe", side_effect=transcribe_side_effect) as transcribe,
+            ):
+                result = transcribe_all(work_dir)
+
+            self.assertEqual(result, (0, 1))
+            self.assertTrue(transcribe.called)
+            self.assertFalse(empty.exists())
 
     def test_zoom_transcript_retention_is_opt_in(self):
         from transcribe_missing import has_zoom_transcripts

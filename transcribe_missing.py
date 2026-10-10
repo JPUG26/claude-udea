@@ -45,6 +45,7 @@ LANGUAGE = "es"
 # Transcribir por bloques: acota la RAM (audios de 4h enteros mataban el proceso
 # en la Pi) y permite reanudar desde el último bloque completado tras un crash.
 CHUNK_SECONDS = 1200
+WHISPER_MARK = "generada localmente con faster-whisper"
 
 
 def log(msg):
@@ -190,6 +191,24 @@ def _recording_transcripts(course_dir: Path, rec_id: str, rec_info: dict) -> lis
     ]
 
 
+def _is_whisper_file(transcript: Path) -> bool:
+    try:
+        return WHISPER_MARK in transcript.read_text(encoding="utf-8", errors="replace")[:500]
+    except OSError:
+        return False
+
+
+def _is_correct_whisper_transcript(transcript: Path) -> bool:
+    """Correcta = cabecera de faster-whisper y al menos un cue con tiempos.
+    Un VTT solo con cabecera (transcripción vacía o truncada) se vuelve a procesar."""
+    if not _is_whisper_file(transcript):
+        return False
+    try:
+        return "-->" in transcript.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
 def _has_whisper_transcript(
     course_dir: Path,
     rec_id: str,
@@ -199,15 +218,7 @@ def _has_whisper_transcript(
     candidates = _recording_transcripts(course_dir, rec_id, rec_info)
     if expected_transcript and expected_transcript.is_file():
         candidates.append(expected_transcript)
-    for transcript in candidates:
-        try:
-            if "generada localmente con faster-whisper" in transcript.read_text(
-                encoding="utf-8", errors="replace"
-            )[:500]:
-                return True
-        except OSError:
-            continue
-    return False
+    return any(_is_correct_whisper_transcript(transcript) for transcript in candidates)
 
 
 def _existing_video(course_dir: Path, rec_id: str, rec_info: dict) -> Path | None:
@@ -257,6 +268,7 @@ def transcribe_all(
     id_map = _build_rec_id_map(recordings)
 
     pending = []
+    already_done = 0
     for slug in selected_courses:
         course = recordings.get(slug)
         if not course:
@@ -268,11 +280,14 @@ def transcribe_all(
                 course_dir / "transcripts" / "whisper"
                 / recording_filename(metadata, ".whisper.transcript.vtt")
             )
-            if rec_info.get("url") and not _has_whisper_transcript(
-                course_dir, rec_id, rec_info, expected_transcript
-            ):
+            if not rec_info.get("url"):
+                continue
+            if _has_whisper_transcript(course_dir, rec_id, rec_info, expected_transcript):
+                already_done += 1
+            else:
                 pending.append((slug, rec_id, rec_info))
 
+    log(f"{already_done} grabaciones ya transcritas correctamente; se omiten.")
     if not pending:
         log("Todas las grabaciones seleccionadas ya tienen transcripción de faster-whisper.")
         return 0, 0
@@ -334,11 +349,16 @@ def transcribe_all(
             log(f"  ERROR transcribiendo {label}: {error}; se conserva audio para reanudar")
             failed += 1
             continue
+        if not _is_correct_whisper_transcript(destination):
+            # Sin cues: no se considera correcta; se conserva el audio para reintentar
+            # en la próxima ejecución y no se borran los subtítulos de Zoom.
+            destination.unlink(missing_ok=True)
+            log(f"  ERROR {label}: transcripción vacía; se reintentará en la próxima ejecución")
+            failed += 1
+            continue
         wav.unlink(missing_ok=True)
         for previous_transcript in _recording_transcripts(course_dir, rec_id, rec_info):
-            is_whisper = "generada localmente con faster-whisper" in previous_transcript.read_text(
-                encoding="utf-8", errors="replace"
-            )[:500]
+            is_whisper = _is_whisper_file(previous_transcript)
             if previous_transcript != destination and (is_whisper or not keep_zoom_transcripts):
                 previous_transcript.unlink(missing_ok=True)
         ok += 1

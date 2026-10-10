@@ -191,7 +191,7 @@ Ollama se conecta a `OLLAMA_HOST` o, por defecto, a `http://127.0.0.1:11434`.
 claude_udea --always-whisper --skip-video
 ```
 
-Descarga temporalmente los videos que hagan falta y genera una VTT local. Si Zoom también proporciona subtítulos, el programa pregunta si quieres conservar ambas versiones. Whisper queda en `transcripts/whisper/` y los originales en `transcripts/zoom/`. La opción se aplica a las asignaturas seleccionadas; puedes indicar slugs para limitarla. Los resultados ya generados por faster-whisper se conservan y no se vuelven a procesar en cada ejecución. Requiere `faster-whisper`, FFmpeg y ffprobe.
+Descarga temporalmente los videos que hagan falta y genera una VTT local. Si Zoom también proporciona subtítulos, el programa pregunta si quieres conservar ambas versiones. Whisper queda en `transcripts/whisper/` y los originales en `transcripts/zoom/`. La opción se aplica a las asignaturas seleccionadas; puedes indicar slugs para limitarla. Las transcripciones de faster-whisper ya correctas (con al menos un segmento) se conservan y no se vuelven a procesar; las vacías se reintentan en la siguiente ejecución. Requiere `faster-whisper`, FFmpeg y ffprobe.
 
 ### Ejecutar sin asistente
 
