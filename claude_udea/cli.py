@@ -994,7 +994,7 @@ def main():
     )
 
     if always_whisper and not dry_run:
-        from transcribe_missing import has_zoom_transcripts, transcribe_all
+        from transcribe_missing import has_zoom_transcripts, settings_from_args, transcribe_all
         try:
             keep_zoom_transcripts = False
             if has_zoom_transcripts(work_dir, target_courses):
@@ -1004,10 +1004,19 @@ def main():
                 ).ask()
                 if keep_zoom_transcripts is None:
                     sys.exit(0)
+            class_numbers = []
+            for index, token in enumerate(args):
+                if token == "--class" and index + 1 < len(args):
+                    try:
+                        class_numbers.append(int(args[index + 1]))
+                    except ValueError:
+                        pass
             whisper_ok, whisper_failed = transcribe_all(
                 work_dir,
                 target_courses,
                 keep_zoom_transcripts=keep_zoom_transcripts,
+                settings=settings_from_args(args),
+                class_numbers=class_numbers or None,
             )
             failed += whisper_failed
             print(f"  faster-whisper: {whisper_ok} completadas, {whisper_failed} fallidas.\n")

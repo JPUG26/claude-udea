@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
@@ -80,14 +81,65 @@ def _file_matches(path: Path, alias_ids: list[str], date: str, prefix: str, numb
         return _class_number_from_filename(name) == number
     return True
 
-MODEL_SIZE = "small"          # mejor balance calidad/velocidad en Pi 5 (~1x tiempo real)
-COMPUTE_TYPE = "int8"
-CPU_THREADS = 4
-LANGUAGE = "es"
-# Transcribir por bloques: acota la RAM (audios de 4h enteros mataban el proceso
-# en la Pi) y permite reanudar desde el último bloque completado tras un crash.
-CHUNK_SECONDS = 1200
 WHISPER_MARK = "generada localmente con faster-whisper"
+
+
+@dataclass
+class WhisperSettings:
+    """Parámetros de faster-whisper, configurables por flags.
+
+    Valores por defecto orientados a máxima calidad en un equipo potente en CPU
+    (p. ej. Intel i9 + 24 GB): modelo grande, beam=5 y audio de mejor calidad.
+    Bájalos para acelerar. La GPU Intel (Iris Xe) no la usa CTranslate2; corre en CPU.
+    """
+
+    model: str = "large-v3"
+    compute_type: str = "int8_float32"
+    device: str = "cpu"
+    cpu_threads: int = 8
+    beam_size: int = 5
+    language: str = "es"
+    initial_prompt: str = (
+        "Clase de Arquitectura de Software y Fábrica Escuela de Ingeniería de "
+        "Sistemas de la Universidad de Antioquia."
+    )
+    condition_on_previous_text: bool = True
+    # Transcribir por bloques: acota la RAM y permite reanudar tras un crash.
+    chunk_seconds: int = 1200
+
+
+def settings_from_args(argv: list[str]) -> WhisperSettings:
+    """Construye WhisperSettings a partir de una lista de argumentos.
+
+    Útil para el comando `claude_udea`, que no usa argparse para estas flags.
+    """
+    flag_map = {
+        "--whisper-model": ("model", str),
+        "--whisper-compute-type": ("compute_type", str),
+        "--whisper-device": ("device", str),
+        "--whisper-cpu-threads": ("cpu_threads", int),
+        "--whisper-beam-size": ("beam_size", int),
+        "--whisper-language": ("language", str),
+        "--whisper-initial-prompt": ("initial_prompt", str),
+        "--whisper-chunk-seconds": ("chunk_seconds", int),
+    }
+    values = {}
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in flag_map:
+            attribute, cast = flag_map[token]
+            if index + 1 < len(argv):
+                try:
+                    values[attribute] = cast(argv[index + 1])
+                except ValueError:
+                    pass
+                index += 2
+                continue
+        elif token == "--whisper-no-conditioning":
+            values["condition_on_previous_text"] = False
+        index += 1
+    return WhisperSettings(**values)
 
 
 def log(msg):
@@ -133,7 +185,12 @@ def find_missing(work_dir: Path):
 def download_video(rec, cache_dir: Path) -> Path | None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     out_tpl = str(cache_dir / "%(title)s [%(id)s].%(ext)s")
-    for fmt in (["-f", "view"], []):  # 'view' es el stream más liviano; sin -f como fallback
+    audio_video_exts = {
+        ".m4a", ".mp3", ".opus", ".ogg", ".aac", ".flac", ".wav",
+        ".mp4", ".mkv", ".webm", ".mov",
+    }
+    # Preferir el mejor audio (mejor transcripción); el video liviano es el respaldo.
+    for fmt in (["-f", "bestaudio/best"], ["-f", "view"], []):
         cmd = [sys.executable, "-m", "yt_dlp", "--no-update", "-o", out_tpl,
                "--no-overwrites", "--no-playlist", "--retries", "3",
                "--fragment-retries", "3", *fmt, rec["url"]]
@@ -143,7 +200,7 @@ def download_video(rec, cache_dir: Path) -> Path | None:
             continue
         matches = [
             path for path in cache_dir.glob(f"*{rec['rec_id']}*")
-            if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}
+            if path.suffix.lower() in audio_video_exts
         ]
         if result.returncode == 0 and matches:
             return matches[0]
@@ -168,29 +225,34 @@ def wav_duration(wav: Path) -> float:
     return float(result.stdout.strip())
 
 
-def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path):
-    """Transcribe por bloques de CHUNK_SECONDS con resultados parciales en
-    parts_dir; si un bloque ya tiene su .json, se salta (reanudación)."""
+def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path,
+               settings: "WhisperSettings | None" = None):
+    """Transcribe por bloques con resultados parciales en parts_dir; si un bloque
+    ya tiene su .json, se salta (reanudación). Los parámetros de calidad vienen de
+    `settings` (modelo, beam, prompt, condición de contexto)."""
+    settings = settings or WhisperSettings()
     total = wav_duration(wav)
-    n_chunks = max(1, math.ceil(total / CHUNK_SECONDS))
+    n_chunks = max(1, math.ceil(total / settings.chunk_seconds))
     parts_dir.mkdir(parents=True, exist_ok=True)
 
     for i in range(n_chunks):
         part_json = parts_dir / f"part{i:03d}.json"
         if part_json.exists():
             continue
-        offset = i * CHUNK_SECONDS
+        offset = i * settings.chunk_seconds
         chunk_wav = parts_dir / "chunk.wav"
         subprocess.run(
             ["ffmpeg", "-y", "-loglevel", "error", "-ss", str(offset),
-             "-t", str(CHUNK_SECONDS), "-i", str(wav), "-c:a", "pcm_s16le", str(chunk_wav)],
+             "-t", str(settings.chunk_seconds), "-i", str(wav),
+             "-c:a", "pcm_s16le", str(chunk_wav)],
             capture_output=True, timeout=600, check=True)
         segments, _info = model.transcribe(
             str(chunk_wav),
-            language=LANGUAGE,
+            language=settings.language,
             vad_filter=True,
-            beam_size=1,
-            condition_on_previous_text=False,  # evita bucles de repetición
+            beam_size=settings.beam_size,
+            initial_prompt=settings.initial_prompt or None,
+            condition_on_previous_text=settings.condition_on_previous_text,
         )
         data = [{"start": s.start + offset, "end": s.end + offset,
                  "text": s.text.strip()} for s in segments if s.text.strip()]
@@ -209,7 +271,7 @@ def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path):
     try:
         with open(temporary_vtt, "w", encoding="utf-8") as f:
             f.write("WEBVTT\n\nNOTE\nTranscripción generada localmente con "
-                    f"faster-whisper ({MODEL_SIZE}, {COMPUTE_TYPE})\n\n")
+                    f"faster-whisper ({settings.model}, {settings.compute_type})\n\n")
             for i, seg in enumerate(cues, 1):
                 f.write(f"{i}\n{fmt_ts(seg['start'])} --> {fmt_ts(seg['end'])}\n"
                         f"{seg['text']}\n\n")
@@ -342,8 +404,15 @@ def transcribe_all(
     work_dir: Path,
     course_slugs: list[str] | None = None,
     keep_zoom_transcripts: bool = False,
+    settings: "WhisperSettings | None" = None,
+    class_numbers: "set[int] | list[int] | None" = None,
 ) -> tuple[int, int]:
-    """Transcribe con Whisper todas las grabaciones seleccionadas sin transcript Whisper previo."""
+    """Transcribe con Whisper las grabaciones seleccionadas sin transcript Whisper previo.
+
+    `course_slugs` limita a cursos concretos; `class_numbers` limita a clases concretas.
+    """
+    settings = settings or WhisperSettings()
+    class_numbers = set(class_numbers) if class_numbers else None
     recordings_path = work_dir / "recordings.json"
     recordings = json.loads(recordings_path.read_text(encoding="utf-8"))
     selected_courses = course_slugs or list(recordings)
@@ -361,6 +430,8 @@ def transcribe_all(
         course_dir = download_dir / slug
         for rec_id, rec_info in course.get("recordings", {}).items():
             metadata = id_map[rec_id]
+            if class_numbers is not None and metadata.get("class_number") not in class_numbers:
+                continue
             expected_transcript = (
                 course_dir / "transcripts" / "whisper"
                 / recording_filename(metadata, ".whisper.transcript.vtt")
@@ -385,12 +456,13 @@ def transcribe_all(
         ) from error
 
     log(f"{len(pending)} grabaciones pendientes de transcripción local.")
-    log(f"Cargando modelo {MODEL_SIZE} ({COMPUTE_TYPE}); el primer inicio descarga el modelo.")
+    log(f"Cargando modelo {settings.model} ({settings.compute_type}, "
+        f"device={settings.device}); el primer inicio descarga el modelo.")
     model = WhisperModel(
-        MODEL_SIZE,
-        device="cpu",
-        compute_type=COMPUTE_TYPE,
-        cpu_threads=CPU_THREADS,
+        settings.model,
+        device=settings.device,
+        compute_type=settings.compute_type,
+        cpu_threads=settings.cpu_threads,
     )
     ok = failed = 0
 
@@ -429,7 +501,7 @@ def transcribe_all(
         parts_dir = cache_dir / f"parts-{hashlib.sha256(rec_id.encode()).hexdigest()[:16]}"
         log(f"  Transcribiendo con faster-whisper: {label}")
         try:
-            transcribe(model, wav, destination, parts_dir)
+            transcribe(model, wav, destination, parts_dir, settings)
         except Exception as error:
             log(f"  ERROR transcribiendo {label}: {error}; se conserva audio para reanudar")
             failed += 1
@@ -465,14 +537,49 @@ def main():
                         help="conservar la VTT original de Zoom junto con la de Whisper")
     parser.add_argument("--course", action="append", dest="courses",
                         help="slug del curso; se puede repetir")
+    parser.add_argument("--class", action="append", type=int, dest="class_numbers",
+                        help="número de clase a transcribir (se puede repetir)")
+    default = WhisperSettings()
+    parser.add_argument("--whisper-model", default=default.model,
+                        help=f"modelo faster-whisper (default: {default.model})")
+    parser.add_argument("--whisper-compute-type", default=default.compute_type,
+                        help=f"tipo de cómputo (default: {default.compute_type})")
+    parser.add_argument("--whisper-device", default=default.device,
+                        help=f"cpu o cuda (default: {default.device})")
+    parser.add_argument("--whisper-cpu-threads", type=int, default=default.cpu_threads,
+                        help=f"hilos de CPU (default: {default.cpu_threads})")
+    parser.add_argument("--whisper-beam-size", type=int, default=default.beam_size,
+                        help=f"beam size (default: {default.beam_size})")
+    parser.add_argument("--whisper-language", default=default.language,
+                        help=f"idioma (default: {default.language})")
+    parser.add_argument("--whisper-initial-prompt", default=default.initial_prompt,
+                        help="texto de contexto para mejorar términos propios")
+    parser.add_argument("--whisper-chunk-seconds", type=int, default=default.chunk_seconds,
+                        help=f"segundos por bloque (default: {default.chunk_seconds})")
+    parser.add_argument("--whisper-no-conditioning", action="store_true",
+                        help="desactivar condition_on_previous_text (evita bucles)")
     args = parser.parse_args()
+
+    settings = WhisperSettings(
+        model=args.whisper_model,
+        compute_type=args.whisper_compute_type,
+        device=args.whisper_device,
+        cpu_threads=args.whisper_cpu_threads,
+        beam_size=args.whisper_beam_size,
+        language=args.whisper_language,
+        initial_prompt=args.whisper_initial_prompt,
+        condition_on_previous_text=not args.whisper_no_conditioning,
+        chunk_seconds=args.whisper_chunk_seconds,
+    )
 
     work_dir = Path(args.work_dir)
     if args.always_whisper:
         keep_zoom = args.keep_zoom_transcripts
         if not keep_zoom and has_zoom_transcripts(work_dir, args.courses):
             keep_zoom = input("¿Conservar también las transcripciones originales de Zoom? [S/n]: ").strip().lower() not in {"n", "no"}
-        ok, failed = transcribe_all(work_dir, args.courses, keep_zoom)
+        ok, failed = transcribe_all(
+            work_dir, args.courses, keep_zoom, settings, args.class_numbers
+        )
         if ok:
             recordings_path = work_dir / "recordings.json"
             recordings = json.loads(recordings_path.read_text(encoding="utf-8"))
@@ -502,9 +609,9 @@ def main():
     cache_dir.mkdir(exist_ok=True)
 
     from faster_whisper import WhisperModel
-    log(f"Cargando modelo {MODEL_SIZE} ({COMPUTE_TYPE})...")
-    model = WhisperModel(MODEL_SIZE, device="cpu",
-                         compute_type=COMPUTE_TYPE, cpu_threads=CPU_THREADS)
+    log(f"Cargando modelo {settings.model} ({settings.compute_type})...")
+    model = WhisperModel(settings.model, device=settings.device,
+                         compute_type=settings.compute_type, cpu_threads=settings.cpu_threads)
 
     ok, failed = 0, 0
     for rec in missing:
@@ -534,7 +641,7 @@ def main():
         parts_dir = cache_dir / f"parts-{rec['rec_id'].split('.')[0][:16]}"
         log(f"  Transcribiendo (esto puede tardar ~{rec['duration']} min)...")
         try:
-            transcribe(model, wav, dest, parts_dir)
+            transcribe(model, wav, dest, parts_dir, settings)
         except Exception as e:
             log(f"  ERROR transcribiendo {label}: {e} (el wav y los bloques "
                 "quedan en cache para reanudar)")

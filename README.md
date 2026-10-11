@@ -198,6 +198,55 @@ claude_udea --always-whisper --skip-video
 
 Descarga temporalmente los videos que hagan falta y genera una VTT local. Si Zoom también proporciona subtítulos, el programa pregunta si quieres conservar ambas versiones. Whisper queda en `transcripts/whisper/` y los originales en `transcripts/zoom/`. La opción se aplica a las asignaturas seleccionadas; puedes indicar slugs para limitarla. Las transcripciones de faster-whisper ya correctas (con al menos un segmento) se conservan y no se vuelven a procesar; las vacías se reintentan en la siguiente ejecución. Requiere `faster-whisper`, FFmpeg y ffprobe.
 
+### Calidad de la transcripción (faster-whisper)
+
+Los parámetros de faster-whisper son configurables por flags. Por defecto se busca **máxima calidad** en CPU (pensado para un equipo potente, p. ej. Intel i9 + 24 GB); baja el modelo para acelerar. La GPU Intel (Iris Xe) no la usa CTranslate2, así que se corre en CPU.
+
+| Flag | Default | Descripción |
+|------|---------|-------------|
+| `--whisper-model` | `large-v3` | Modelo (`tiny`, `base`, `small`, `medium`, `large-v2`, `large-v3`). Más grande = más preciso y más lento |
+| `--whisper-compute-type` | `int8_float32` | Cómputo de CTranslate2 (`int8`, `int8_float32`, `float32`; `float16` solo con GPU NVIDIA) |
+| `--whisper-device` | `cpu` | `cpu` o `cuda` (NVIDIA) |
+| `--whisper-cpu-threads` | `8` | Hilos de CPU |
+| `--whisper-beam-size` | `5` | Anchura de búsqueda (mayor = más preciso, más lento) |
+| `--whisper-language` | `es` | Idioma |
+| `--whisper-initial-prompt` | (texto del curso) | Contexto para mejorar términos propios; vacío para desactivarlo |
+| `--whisper-chunk-seconds` | `1200` | Segundos por bloque (acota RAM y permite reanudar) |
+| `--whisper-no-conditioning` | desactivado | Desactiva `condition_on_previous_text` (evita bucles de repetición) |
+
+Además, al transcribir se descarga el **mejor audio** disponible (no el video liviano), lo que mejora el resultado. Ejemplos:
+
+```bash
+# Máxima calidad (default)
+claude_udea --always-whisper --skip-video
+
+# Equilibrio rapidez/calidad
+claude_udea --always-whisper --skip-video --whisper-model medium --whisper-beam-size 3
+
+# Rápido en equipos modestos
+claude_udea --always-whisper --skip-video --whisper-model small --whisper-compute-type int8
+
+# Con GPU NVIDIA
+claude_udea --always-whisper --skip-video --whisper-device cuda --whisper-compute-type float16 --whisper-model large-v3
+```
+
+Los mismos flags funcionan al usar `transcribe_missing.py` directamente (`python transcribe_missing.py --always-whisper --whisper-model medium ...`).
+
+**Limitar a un curso o una clase.** El curso se indica con su slug (posicional en `claude_udea`, o con `--course` en `transcribe_missing.py`) y la clase con `--class` (número de clase, repetible):
+
+```bash
+# Solo un curso
+claude_udea --always-whisper --skip-video modelos-y-simulacion-de-sistemas-ii
+
+# Solo las clases 9 y 10 de un curso
+claude_udea --always-whisper --skip-video modelos-y-simulacion-de-sistemas-ii --class 9 --class 10
+
+# Equivalente con transcribe_missing.py
+python transcribe_missing.py --always-whisper --course arquitectura-de-software --class 5
+```
+
+Para **reemplazar** transcripciones anteriores (por ejemplo, al cambiar de modelo), mueve a un respaldo los `.whisper.transcript.vtt` en `transcripts/whisper/` del curso y vuelve a ejecutar; las existentes correctas se conservan y solo se reprocesan las que faltan.
+
 ### Ejecutar sin asistente
 
 ```bash

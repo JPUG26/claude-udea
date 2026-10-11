@@ -45,7 +45,7 @@ class WhisperTranscriptionTests(unittest.TestCase):
                 wav.write_bytes(b"audio")
                 return wav
 
-            def transcribe_side_effect(model, wav, destination, parts_dir):
+            def transcribe_side_effect(model, wav, destination, parts_dir, settings=None):
                 destination.write_text(
                     "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n\n"
                     "1\n00:00:00.000 --> 00:00:01.000\nHola\n",
@@ -121,7 +121,7 @@ class WhisperTranscriptionTests(unittest.TestCase):
                 wav.write_bytes(b"audio")
                 return wav
 
-            def transcribe_side_effect(_model, _wav, destination, _parts_dir):
+            def transcribe_side_effect(_model, _wav, destination, _parts_dir, _settings=None):
                 destination.write_text(
                     "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n"
                     "\n1\n00:00:00.000 --> 00:00:01.000\nHola\n",
@@ -204,7 +204,7 @@ class WhisperTranscriptionTests(unittest.TestCase):
                 wav.write_bytes(b"audio")
                 return wav
 
-            def transcribe_side_effect(_model, _wav, destination, _parts_dir):
+            def transcribe_side_effect(_model, _wav, destination, _parts_dir, _settings=None):
                 destination.write_text(
                     "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n",
                     encoding="utf-8",
@@ -245,6 +245,53 @@ class WhisperTranscriptionTests(unittest.TestCase):
             )
 
             self.assertTrue(has_zoom_transcripts(work_dir))
+
+    def test_class_filter_transcribes_only_selected_class(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            course_dir = work_dir / "downloads" / "software-architecture"
+            course_dir.mkdir(parents=True)
+            (work_dir / "recordings.json").write_text(
+                json.dumps({
+                    "software-architecture": {
+                        "recordings": {
+                            "rec-1": {"url": "https://zoom.example/1", "start_date": "2026-01-01T10:00:00Z"},
+                            "rec-2": {"url": "https://zoom.example/2", "start_date": "2026-01-02T10:00:00Z"},
+                        }
+                    }
+                }),
+                encoding="utf-8",
+            )
+            (course_dir / "Clase [rec-1].mp4").write_bytes(b"v")
+            (course_dir / "Clase [rec-2].mp4").write_bytes(b"v")
+
+            faster_whisper = ModuleType("faster_whisper")
+            faster_whisper.WhisperModel = Mock(return_value=Mock())
+            transcribed = []
+
+            def extract_audio_side_effect(source, remove_video=True):
+                wav = source.with_suffix(".wav")
+                wav.write_bytes(b"audio")
+                return wav
+
+            def transcribe_side_effect(_model, _wav, destination, _parts_dir, _settings=None):
+                transcribed.append(destination.name)
+                destination.write_text(
+                    "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper\n"
+                    "\n1\n00:00:00.000 --> 00:00:01.000\nHola\n",
+                    encoding="utf-8",
+                )
+
+            with (
+                patch.dict("sys.modules", {"faster_whisper": faster_whisper}),
+                patch("transcribe_missing.extract_audio", side_effect=extract_audio_side_effect),
+                patch("transcribe_missing.transcribe", side_effect=transcribe_side_effect),
+            ):
+                result = transcribe_all(work_dir, class_numbers=[2])
+
+        self.assertEqual(result, (1, 0))
+        self.assertTrue(any("Clase #2" in name for name in transcribed))
+        self.assertFalse(any("Clase #1" in name for name in transcribed))
 
 
 if __name__ == "__main__":
