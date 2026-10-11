@@ -3,13 +3,11 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 from claude_udea.download import (
     _build_rec_id_map,
     _class_category_for,
     _class_filename,
-    _download_chat,
     _filename_suffix,
     _recording_alias_ids,
     _recording_category,
@@ -193,7 +191,6 @@ class ClassNumberingTests(unittest.TestCase):
                 "Architecture [recording-1].mp4",
                 "Architecture [recording-1].transcript.vtt",
                 "Architecture [recording-1].whisper.transcript.vtt",
-                "Architecture [recording-1].chat.txt",
             ]
             for name in names:
                 (course_dir / name).write_text("WEBVTT\n" if name.endswith(".vtt") else "chat", encoding="utf-8")
@@ -211,13 +208,12 @@ class ClassNumberingTests(unittest.TestCase):
             "transcripts/whisper/Clase #1 - 2026-02-01.whisper.transcript.vtt",
             organized,
         )
-        self.assertIn("chat/Clase #1 - 2026-02-01.chat.txt", organized)
 
     def test_asset_category_classifier(self):
         self.assertEqual(_recording_category("Clase [id].mp4", ".mp4"), "videos")
         self.assertEqual(_recording_category("Clase [id].transcript.vtt", ".transcript.vtt"), "transcripts/zoom")
         self.assertEqual(_recording_category("Clase [id].whisper.transcript.vtt", ".whisper.transcript.vtt"), "transcripts/whisper")
-        self.assertEqual(_recording_category("Clase [id].chat.txt", ".chat.txt"), "chat")
+        self.assertEqual(_recording_category("Clase [id].chat.txt", ".chat.txt"), "")
 
     def test_migrates_older_whisper_vtt_by_its_note_marker(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -630,57 +626,6 @@ class RecordingMergeTests(unittest.TestCase):
         pending = _merge_scraped(existing, config, "architecture", [link, link])
 
         self.assertEqual(len(pending), 1)
-
-
-class ChatDownloadTests(unittest.TestCase):
-    def test_downloads_chat_file_from_share_page(self):
-        share_url = "https://zoom.example/rec/share/abc123"
-        chat_url = "https://zoom.example/rec/chat/abc123_chat.txt"
-        share_html = f'<html><body><a href="{chat_url}">Chat</a></body></html>'
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            output_dir = Path(temporary_directory)
-
-            def side_effect(url, **kwargs):
-                response = Mock()
-                response.raise_for_status = Mock()
-                response.headers = {}
-                response.url = url
-                if url == share_url:
-                    response.text = share_html
-                    return response
-                if url == chat_url:
-                    response.content = b"chat content"
-                    return response
-                raise AssertionError(f"unexpected url {url}")
-
-            with patch("claude_udea.download.requests.get", side_effect=side_effect):
-                result = _download_chat(share_url, output_dir)
-
-            self.assertTrue(result)
-            chat_file = output_dir / "Recording [abc123].chat.txt"
-            self.assertTrue(chat_file.is_file())
-            self.assertEqual(chat_file.read_bytes(), b"chat content")
-
-    def test_returns_false_when_no_chat_link(self):
-        share_url = "https://zoom.example/rec/share/abc123"
-        share_html = '<html><body><a href="/rec/play/abc123">Ver</a></body></html>'
-
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            output_dir = Path(temporary_directory)
-
-            def side_effect(url, **kwargs):
-                response = Mock()
-                response.raise_for_status = Mock()
-                response.headers = {}
-                response.url = url
-                response.text = share_html
-                return response
-
-            with patch("claude_udea.download.requests.get", side_effect=side_effect):
-                result = _download_chat(share_url, output_dir)
-
-            self.assertFalse(result)
 
 
 if __name__ == "__main__":

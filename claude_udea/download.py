@@ -13,10 +13,6 @@ import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
-
-import requests
-from bs4 import BeautifulSoup
 
 
 def get_archive_path(download_dir: Path) -> Path:
@@ -82,7 +78,6 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False,
         if result.returncode == 0:
             if dry_run:
                 return "ok"
-            _download_chat(url, output_dir)
             if skip_video:
                 return "ok" if any(
                     path.is_file() and path.suffix.lower() in {".vtt", ".srt"}
@@ -112,38 +107,6 @@ def download_one(url, output_dir, archive_path, skip_video=False, dry_run=False,
         return "error"
     except Exception:
         return "error"
-
-
-def _download_chat(url: str, output_dir: Path) -> bool:
-    """Descarga el archivo de chat de una grabación Zoom desde la página /rec/share/."""
-    rec_id = _extract_rec_id_from_url(url)
-    if not rec_id:
-        return False
-    try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        chat_url = None
-        for anchor in soup.select("a[href]"):
-            href = anchor.get("href", "")
-            text = anchor.get_text(" ", strip=True).casefold()
-            if "chat" in href.casefold() or "chat" in text:
-                chat_url = href
-                break
-        if not chat_url:
-            return False
-        if not chat_url.startswith(("http://", "https://")):
-            chat_url = urljoin(response.url, chat_url)
-
-        chat_response = requests.get(chat_url, timeout=60)
-        chat_response.raise_for_status()
-
-        output_dir.mkdir(parents=True, exist_ok=True)
-        target = output_dir / f"Recording [{rec_id}].chat.txt"
-        target.write_bytes(chat_response.content)
-        return True
-    except Exception:
-        return False
 
 
 def _extract_rec_id_from_url(url: str) -> str:
@@ -320,8 +283,6 @@ def _recording_category(filename: str, suffix: str, source: Path | None = None) 
         return "transcripts/whisper" if is_whisper else "transcripts/zoom"
     if Path(lowered).suffix in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}:
         return "videos"
-    if "chat" in Path(lowered).name and Path(lowered).suffix in {".txt", ".json", ".vtt", ".csv"}:
-        return "chat"
     return ""
 
 
@@ -501,6 +462,9 @@ def copy_transcripts(download_dir: Path, recordings: dict = None, course_options
             continue
         slug = course_dir.name
         for vtt_file in course_dir.rglob("*.vtt"):
+            rel_parts = vtt_file.relative_to(course_dir).parts
+            if any(part in {".claude-udea-backup", "sin-clasificar", "incompletos"} for part in rel_parts):
+                continue
             process_vtt(vtt_file, slug)
 
     # Ordenar por fecha
@@ -564,7 +528,6 @@ def rename_downloads(download_dir: Path, recordings: dict, course_options: dict 
             "videos",
             "transcripts/zoom",
             "transcripts/whisper",
-            "chat",
         ):
             (course_dir / category_dir).mkdir(parents=True, exist_ok=True)
 
@@ -740,8 +703,6 @@ def _sweep_unclassified(course_dir: Path) -> None:
                 except OSError:
                     pass
             category = "transcripts/whisper" if is_whisper else "transcripts/zoom"
-        elif "chat" in entry.name and entry.suffix.lower() in {".txt", ".json", ".vtt", ".csv"}:
-            category = "chat"
         else:
             category = "sin-clasificar"
         target_dir = course_dir / category
