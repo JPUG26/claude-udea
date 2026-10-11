@@ -2,16 +2,21 @@ import json
 import tempfile
 import unittest
 import uuid
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from claude_udea.download import (
     _build_rec_id_map,
     _class_category_for,
     _class_filename,
     _filename_suffix,
+    _split_part,
     _recording_alias_ids,
     _recording_category,
     copy_transcripts,
+    repair_course,
     rename_downloads,
 )
 
@@ -354,6 +359,14 @@ class FilenameSuffixTests(unittest.TestCase):
         self.assertEqual(
             _filename_suffix("Clase #1 - 2026-02-01.transcript.vtt", ""),
             ".transcript.vtt",
+        )
+
+    def test_part_markers_are_not_part_of_the_suffix(self):
+        filename = "Clase #15 - 2026-09-29 - Parte 1 - Parte 2.cc.vtt"
+        self.assertEqual(_filename_suffix(filename, ""), ".cc.vtt")
+        self.assertEqual(
+            _split_part(filename),
+            ("Clase #15 - 2026-09-29", (1, 2), ".cc.vtt"),
         )
 
 
@@ -898,6 +911,385 @@ class RecordingAliasTests(unittest.TestCase):
             self.assertTrue((course_dir / "videos" / "Clase #1 - 2026-08-12.mp4").is_file())
 
 
+class PartOrganizationTests(unittest.TestCase):
+    def test_same_record_raw_duplicates_do_not_mark_url_suspect(self):
+        recordings = RepairCourseTests._recordings("2026-09-01")
+        rec = recordings["architecture"]["recordings"]["rec-1"]
+        rec["url"] = "https://zoom.example/rec/share/rec-1"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            downloads = Path(temporary_directory)
+            course_dir = downloads / "architecture"
+            course_dir.mkdir()
+            for name in ("First [rec-1].mp4", "Second [rec-1 copy 2].mp4"):
+                (course_dir / name).write_bytes(b"same")
+            rename_downloads(downloads, recordings)
+            self.assertNotIn("suspect_url", rec)
+            self.assertTrue((course_dir / "videos" / "Clase #1 - 2026-09-01.mp4").exists())
+
+    def test_duplicate_video_caption_inherits_retained_part(self):
+        recordings = RepairCourseTests._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            downloads = Path(temporary_directory)
+            course_dir = downloads / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            (videos / "Clase #1 - 2026-09-01.mp4").write_bytes(b"primary")
+            (videos / "Clase #1 - 2026-09-01 - Parte 1.mp4").write_bytes(b"part")
+            (course_dir / "Raw [rec-1].mp4").write_bytes(b"part")
+            (course_dir / "Raw [rec-1].cc.vtt").write_bytes(b"WEBVTT\ncaption")
+            rename_downloads(downloads, recordings)
+            self.assertTrue((course_dir / "transcripts/zoom" / "Clase #1 - 2026-09-01 - Parte 1.cc.vtt").exists())
+            self.assertFalse((course_dir / "transcripts/zoom" / "Clase #1 - 2026-09-01.cc.vtt").exists())
+
+    def test_stale_paths_do_not_claim_other_class_assets(self):
+        recordings = RepairCourseTests._recordings("2026-09-01", "2026-09-02")
+        recs = recordings["architecture"]["recordings"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "architecture"
+            zoom = course_dir / "transcripts" / "zoom"
+            videos = course_dir / "videos"
+            zoom.mkdir(parents=True)
+            videos.mkdir()
+            names = ["videos/Clase #1 - 2026-09-01.mp4", "transcripts/zoom/Clase #1 - 2026-09-01.cc.vtt"]
+            for name in names:
+                (course_dir / name).write_bytes(b"original")
+            recs["rec-2"]["organized_files"] = names
+            rename_downloads(download_dir, recordings)
+            for name in names:
+                self.assertEqual((course_dir / name).read_bytes(), b"original")
+            self.assertEqual(recs["rec-2"]["organized_files"], [])
+
+    def test_video_and_zoom_transcripts_share_collision_part(self):
+        recordings = {
+            "architecture": {
+                "recordings": {
+                    rec_id: {
+                        "title": "Architecture",
+                        "start_date": "2026-09-01T10:00:00Z",
+                        "url": f"https://zoom.example/rec/share/{rec_id}",
+                    }
+                    for rec_id in ("rec-a", "rec-b")
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "architecture"
+            course_dir.mkdir()
+            for rec_id, data in (("rec-a", b"a"), ("rec-b", b"b")):
+                (course_dir / f"Architecture [{rec_id}].mp4").write_bytes(data)
+                (course_dir / f"Architecture [{rec_id}].cc.vtt").write_text(
+                    f"WEBVTT\n\n{rec_id}\n", encoding="utf-8",
+                )
+
+            rename_downloads(download_dir, recordings)
+
+            videos = course_dir / "videos"
+            zoom = course_dir / "transcripts" / "zoom"
+            self.assertTrue((videos / "Clase #1 - 2026-09-01.mp4").is_file())
+            self.assertTrue((videos / "Clase #1 - 2026-09-01 - Parte 1.mp4").is_file())
+            self.assertTrue((zoom / "Clase #1 - 2026-09-01.cc.vtt").is_file())
+            self.assertTrue((zoom / "Clase #1 - 2026-09-01 - Parte 1.cc.vtt").is_file())
+
+    def test_subs_only_ignores_archive_and_skips_video(self):
+        from claude_udea.download import download_one
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output_dir = Path(temporary_directory)
+            archive = output_dir / ".download-archive.txt"
+            archive.write_text("zoom rec-1\n", encoding="utf-8")
+            commands = []
+
+            def run(command, **_kwargs):
+                commands.append(command)
+                (output_dir / "subtitles.cc.vtt").write_text("WEBVTT\n", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("claude_udea.download.subprocess.run", side_effect=run):
+                status = download_one(
+                    "https://zoom.example/rec/share/rec-1", output_dir, archive,
+                    subs_only=True,
+                )
+
+            self.assertEqual(status, "ok")
+            self.assertIn("--skip-download", commands[0])
+            self.assertIn("--no-download-archive", commands[0])
+
+
+class RepairCourseTests(unittest.TestCase):
+    @patch("claude_udea.download._ffprobe_available", return_value=True)
+    @patch("claude_udea.download._probe_video", return_value=(30, datetime(2026, 9, 1, 10)))
+    def test_short_valid_video_is_preserved_and_stale_empty_flag_cleared(self, _probe, _available):
+        recordings = self._recordings("2026-09-01")
+        rec = recordings["architecture"]["recordings"]["rec-1"]
+        rec["empty_recording"] = True
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            source = videos / "Clase #1 - 2026-09-01.mp4"
+            source.write_bytes(b"short-valid-video")
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+            self.assertTrue(source.exists())
+            self.assertNotIn("empty_recording", rec)
+
+    @staticmethod
+    def _recordings(*dates):
+        return {
+            "architecture": {
+                "recordings": {
+                    f"rec-{index}": {
+                        "title": "Architecture",
+                        "start_date": f"{date}T10:00:00Z",
+                        "organized_files": [],
+                    }
+                    for index, date in enumerate(dates, start=1)
+                },
+            },
+        }
+
+    def test_dry_run_normalizes_repeated_part_without_moving_files(self):
+        recordings = self._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            zoom = course_dir / "transcripts" / "zoom"
+            videos.mkdir(parents=True)
+            zoom.mkdir(parents=True)
+            video = videos / "Clase #1 - 2026-09-01 - Parte 1 - Parte 1.mp4"
+            caption = zoom / "Clase #1 - 2026-09-01 - Parte 1 - Parte 1.cc.vtt"
+            video.write_bytes(b"x" * (1024 * 1024))
+            caption.write_text("WEBVTT\n\ncaption\n", encoding="utf-8")
+
+            report = repair_course(
+                course_dir, recordings["architecture"], _build_rec_id_map(recordings),
+                dry_run=True,
+            )
+
+            self.assertTrue(any(action[0] == "rename" for action in report["actions"]))
+            self.assertTrue(video.exists())
+            self.assertTrue(caption.exists())
+
+    def test_applies_empty_video_backup_and_marks_recording(self):
+        recordings = self._recordings("2026-09-01")
+        rec_info = recordings["architecture"]["recordings"]["rec-1"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            empty = videos / "Clase #1 - 2026-09-01.mp4"
+            empty.write_bytes(b"empty")
+
+            report = repair_course(
+                course_dir, recordings["architecture"], _build_rec_id_map(recordings),
+            )
+
+            self.assertTrue(report["actions"])
+            self.assertTrue(rec_info["empty_recording"])
+            self.assertFalse(empty.exists())
+            self.assertTrue(
+                (course_dir / ".claude-udea-backup" / "empty-videos" / empty.name).is_file()
+            )
+            manifest = course_dir / ".claude-udea-backup" / "empty-videos" / "manifest.jsonl"
+            self.assertTrue(manifest.is_file())
+
+    @patch("claude_udea.download._ffprobe_available", return_value=True)
+    @patch("claude_udea.download._probe_video", return_value=(3600, datetime(2026, 9, 1, 10)))
+    def test_verified_duplicate_video_keeps_owner_and_repair_is_idempotent(self, _probe, _available):
+        recordings = self._recordings("2026-09-01", "2026-09-02")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            owner = videos / "Clase #1 - 2026-09-01.mp4"
+            duplicate = videos / "Clase #2 - 2026-09-02.mp4"
+            owner.write_bytes(b"x" * (1024 * 1024))
+            duplicate.write_bytes(owner.read_bytes())
+            meta = _build_rec_id_map(recordings)
+            repair_course(course_dir, recordings["architecture"], meta)
+            self.assertTrue(owner.exists())
+            self.assertFalse(duplicate.exists())
+            second = repair_course(course_dir, recordings["architecture"], meta)
+            self.assertEqual(second["actions"], [])
+
+    @patch("claude_udea.download._ffprobe_available", return_value=False)
+    def test_orphan_chapter_is_backed_up_but_primary_chapter_survives(self, _available):
+        recordings = self._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            zoom = course_dir / "transcripts" / "zoom"
+            zoom.mkdir(parents=True)
+            primary = zoom / "Clase #1 - 2026-09-01.chapter.vtt"
+            orphan = zoom / "Clase #1 - 2026-09-01 - Parte 3.chapter.vtt"
+            primary.write_bytes(b"WEBVTT\n")
+            orphan.write_bytes(b"WEBVTT\n")
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+            self.assertTrue(primary.exists())
+            self.assertFalse(orphan.exists())
+            self.assertTrue((course_dir / ".claude-udea-backup" / "orphan-transcripts" / orphan.name).exists())
+
+    def test_central_index_preserves_part_and_zoom_variant(self):
+        recordings = self._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            zoom = download_dir / "architecture" / "transcripts" / "zoom"
+            zoom.mkdir(parents=True)
+            name = "Clase #1 - 2026-09-01 - Parte 2.cc.vtt"
+            (zoom / name).write_text("WEBVTT\n\ncaption\n", encoding="utf-8")
+            copy_transcripts(download_dir, recordings)
+            index = json.loads((download_dir / "transcripts" / "index.json").read_text(encoding="utf-8"))
+            entry = index["architecture"]["files"][0]
+            self.assertEqual(entry["file"], name)
+            self.assertEqual(entry["part"], 2)
+            self.assertEqual(entry["source"], "zoom")
+            self.assertEqual(entry["type"], "cc")
+
+    def test_course_scoped_copy_preserves_other_course_and_index(self):
+        recordings = self._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            downloads = Path(temporary_directory)
+            central = downloads / "transcripts"
+            other = central / "other"
+            other.mkdir(parents=True)
+            kept = other / "existing.vtt"
+            kept.write_bytes(b"untouched")
+            other_index = {"course_name": "Other", "files": [{"file": "existing.vtt"}]}
+            (central / "index.json").write_text(json.dumps({"other": other_index}), encoding="utf-8")
+            zoom = downloads / "architecture" / "transcripts/zoom"
+            zoom.mkdir(parents=True)
+            (zoom / "Clase #1 - 2026-09-01.cc.vtt").write_bytes(b"WEBVTT\n")
+            copy_transcripts(downloads, recordings, course_slugs=["architecture"])
+            self.assertEqual(kept.read_bytes(), b"untouched")
+            index = json.loads((central / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["other"], other_index)
+
+    @patch("claude_udea.download._ffprobe_available", return_value=False)
+    def test_distinct_legacy_part_spellings_never_overwrite_content(self, _available):
+        recordings = self._recordings("2026-09-01")
+        recordings["architecture"]["recordings"]["rec-1"]["duration_minutes"] = 60
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            (videos / "Clase #1 - 2026-09-01 - Parte 1.mp4").write_bytes(b"first")
+            (videos / "Clase #1 - 2026-09-01 (1).mp4").write_bytes(b"second")
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+            self.assertEqual({path.read_bytes() for path in videos.glob("*.mp4")}, {b"first", b"second"})
+
+    def test_repair_command_dry_run_does_not_write_or_download(self):
+        from claude_udea.cli import repair_videos_command
+
+        recordings = self._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            recordings_path = work_dir / "recordings.json"
+            recordings_path.write_text(json.dumps(recordings), encoding="utf-8")
+            before = recordings_path.read_bytes()
+            course_dir = work_dir / "downloads" / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            source = videos / "Clase #1 - 2026-09-01.mp4"
+            source.write_bytes(b"empty")
+            config = {
+                "download_dir": str(work_dir / "downloads"),
+                "recordings_file": str(recordings_path),
+                "courses": {"architecture": {}},
+            }
+            with patch("claude_udea.download.download_one") as download:
+                repair_videos_command(config, ["architecture"], dry_run=True)
+                download.assert_not_called()
+            self.assertEqual(recordings_path.read_bytes(), before)
+            self.assertEqual(source.read_bytes(), b"empty")
+            self.assertFalse((course_dir / ".claude-udea-backup").exists())
+
+    @patch("claude_udea.download._ffprobe_available", return_value=True)
+    @patch("claude_udea.download._probe_video", return_value=(3600, datetime(2026, 9, 2, 10)))
+    def test_reassignment_updates_owner_and_quarantines_unproven_caption(self, _probe, _available):
+        recordings = self._recordings("2026-09-01", "2026-09-02")
+        recs = recordings["architecture"]["recordings"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            zoom = course_dir / "transcripts/zoom"
+            videos.mkdir(parents=True)
+            zoom.mkdir(parents=True)
+            old = "videos/Clase #1 - 2026-09-01.mp4"
+            new = "videos/Clase #2 - 2026-09-02.mp4"
+            (course_dir / old).write_bytes(b"x" * (1024 * 1024))
+            recs["rec-1"]["organized_files"] = [old]
+            caption = zoom / "Clase #1 - 2026-09-01.cc.vtt"
+            caption.write_bytes(b"WEBVTT\nuncertain caption")
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+            self.assertNotIn(new, recs["rec-1"]["organized_files"])
+            self.assertIn(new, recs["rec-2"]["organized_files"])
+            self.assertFalse(caption.exists())
+            self.assertFalse((zoom / "Clase #2 - 2026-09-02.cc.vtt").exists())
+            self.assertTrue(recs["rec-2"]["zoom_subs_missing"])
+
+    def test_whisper_and_chapter_do_not_count_as_zoom_speech_subtitles(self):
+        from claude_udea.cli import _recording_subs_present
+
+        rec_info = self._recordings("2026-09-01")["architecture"]["recordings"]["rec-1"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory)
+            for suffix in (".chapter.vtt", ".whisper.transcript.vtt"):
+                path = course_dir / f"Clase #1 - 2026-09-01{suffix}"
+                path.write_bytes(b"WEBVTT\n")
+            self.assertFalse(_recording_subs_present(course_dir, rec_info))
+            (course_dir / "Clase #1 - 2026-09-01.cc.vtt").write_bytes(b"WEBVTT\n")
+            self.assertTrue(_recording_subs_present(course_dir, rec_info))
+
+    @patch("claude_udea.download._ffprobe_available", return_value=False)
+    def test_lone_part_transcript_is_not_promoted_to_primary(self, _available):
+        recordings = self._recordings("2026-09-01")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            zoom = course_dir / "transcripts" / "zoom"
+            zoom.mkdir(parents=True)
+            source = zoom / "Clase #1 - 2026-09-01 - Parte 2.cc.vtt"
+            source.write_bytes(b"WEBVTT\n")
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+            self.assertFalse(source.exists())
+            self.assertFalse((zoom / "Clase #1 - 2026-09-01.cc.vtt").exists())
+
+    @patch("claude_udea.download._ffprobe_available", return_value=False)
+    def test_rebase_collision_preserves_video_caption_pair(self, _available):
+        recordings = self._recordings("2026-09-01")
+        recordings["architecture"]["recordings"]["rec-1"]["duration_minutes"] = 60
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            for category, suffix in (("videos", ".mp4"), ("transcripts/zoom", ".cc.vtt")):
+                folder = course_dir / category
+                folder.mkdir(parents=True)
+                (folder / f"Clase #1 - 2026-09-01{suffix}").write_bytes(b"first")
+                (folder / f"Clase #9 - 2026-09-01{suffix}").write_bytes(b"second")
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+            self.assertTrue((course_dir / "videos" / "Clase #1 - 2026-09-01 - Parte 1.mp4").exists())
+            self.assertTrue((course_dir / "transcripts/zoom" / "Clase #1 - 2026-09-01 - Parte 1.cc.vtt").exists())
+
+    def test_duplicate_zoom_subtitles_are_backed_up_and_flagged_for_refetch(self):
+        recordings = self._recordings("2026-09-01", "2026-09-02")
+        recs = recordings["architecture"]["recordings"]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            zoom = course_dir / "transcripts" / "zoom"
+            zoom.mkdir(parents=True)
+            first = zoom / "Clase #1 - 2026-09-01.cc.vtt"
+            second = zoom / "Clase #2 - 2026-09-02.cc.vtt"
+            first.write_text("WEBVTT\n\nsame captions\n", encoding="utf-8")
+            second.write_text("WEBVTT\n\nsame captions\n", encoding="utf-8")
+
+            report = repair_course(
+                course_dir, recordings["architecture"], _build_rec_id_map(recordings),
+            )
+
+            self.assertTrue(report["flags"]["rec-1"]["zoom_subs_missing"])
+            self.assertTrue(report["flags"]["rec-2"]["zoom_subs_missing"])
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertEqual(len(list((course_dir / ".claude-udea-backup" / "misassigned-transcripts").glob("*.vtt"))), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
-

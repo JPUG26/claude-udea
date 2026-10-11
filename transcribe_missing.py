@@ -36,7 +36,9 @@ sys.path.insert(0, str(TOOL_DIR))
 from claude_udea.download import (  # noqa: E402
     _build_rec_id_map,
     _class_number_from_filename,
+    _name_conflicts_with,
     _recording_alias_ids,
+    _split_part,
     copy_transcripts,
     recording_filename,
 )
@@ -88,22 +90,23 @@ WHISPER_MARK = "generada localmente con faster-whisper"
 class WhisperSettings:
     """Parámetros de faster-whisper, configurables por flags.
 
-    Valores por defecto orientados a máxima calidad en un equipo potente en CPU
-    (p. ej. Intel i9 + 24 GB): modelo grande, beam=5 y audio de mejor calidad.
-    Bájalos para acelerar. La GPU Intel (Iris Xe) no la usa CTranslate2; corre en CPU.
+    Valores por defecto orientados a un buen equilibrio calidad/velocidad en CPU
+    (p. ej. Intel i9 + 24 GB): modelo `medium` con `int8` y beam=1, que produce
+    resultados en tiempo razonable. Súbelos para más calidad (más lento).
+    La GPU Intel (Iris Xe) no la usa CTranslate2; corre en CPU.
     """
 
-    model: str = "large-v3"
-    compute_type: str = "int8_float32"
+    model: str = "medium"
+    compute_type: str = "int8"
     device: str = "cpu"
     cpu_threads: int = 8
-    beam_size: int = 5
+    beam_size: int = 1
     language: str = "es"
     initial_prompt: str = (
         "Clase de Arquitectura de Software y Fábrica Escuela de Ingeniería de "
         "Sistemas de la Universidad de Antioquia."
     )
-    condition_on_previous_text: bool = True
+    condition_on_previous_text: bool = False
     # Transcribir por bloques: acota la RAM y permite reanudar tras un crash.
     chunk_seconds: int = 1200
 
@@ -154,11 +157,17 @@ def fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def has_transcript(course_dir: Path, rec_id: str, rec_info: dict | None = None, meta: dict | None = None) -> bool:
-    return bool(_recording_transcripts(course_dir, rec_id, rec_info or {}, meta))
+def has_transcript(course_dir: Path, rec_id: str, rec_info: dict | None = None,
+                   meta: dict | None = None, video: Path | None = None) -> bool:
+    return any(
+        _video_slot(transcript) == _video_slot(video)
+        and (not _is_whisper_file(transcript) or _is_correct_whisper_transcript(transcript))
+        for transcript in _recording_transcripts(course_dir, rec_id, rec_info or {}, meta)
+    )
 
 
-def find_missing(work_dir: Path):
+def find_missing(work_dir: Path, course_slugs: list[str] | None = None,
+                 class_numbers: set[int] | list[int] | None = None):
     recordings_path = work_dir / "recordings.json"
     with open(recordings_path, encoding="utf-8") as f:
         recordings = json.load(f)
@@ -167,16 +176,22 @@ def find_missing(work_dir: Path):
     id_map = _build_rec_id_map(recordings, _course_options(work_dir))
     missing = []
     for slug, course in recordings.items():
+        if course_slugs and slug not in course_slugs:
+            continue
         course_dir = download_dir / slug
         for rec_id, info in course.get("recordings", {}).items():
-            if not has_transcript(course_dir, rec_id, info, id_map.get(rec_id)):
-                missing.append({
-                    "slug": slug,
-                    "rec_id": rec_id,
-                    "url": info["url"],
-                    "title": info.get("title", slug),
-                    "duration": info.get("duration_minutes", 0),
-                })
+            meta = id_map[rec_id]
+            if class_numbers and meta.get("class_number") not in class_numbers:
+                continue
+            for video in _existing_videos(course_dir, rec_id, info, meta) or [None]:
+                if not has_transcript(course_dir, rec_id, info, meta, video):
+                    missing.append({
+                        "slug": slug,
+                        "rec_id": rec_id,
+                        "url": info.get("url"),
+                        "title": _whisper_destination(course_dir, meta, video).name,
+                        "duration": info.get("duration_minutes", 0),
+                    })
     # Cortas primero: resultados útiles cuanto antes
     missing.sort(key=lambda r: r["duration"])
     return recordings, missing
@@ -294,14 +309,17 @@ def _recording_transcripts(course_dir: Path, rec_id: str, rec_info: dict, meta: 
     number = meta.get("class_number")
 
     candidates = set()
-    # organized_files es la asociación propia de cada grabación: se confía en ella.
+    # organized_files es la asociación propia de cada grabación, salvo rutas
+    # obsoletas cuyo nombre trae la fecha/categoría de otra clase.
     for relative_path in rec_info.get("organized_files", []):
         path = course_dir / relative_path
+        if meta and _name_conflicts_with(path.name, meta):
+            continue
         if path.is_file() and not _in_backup(path, course_dir):
             candidates.add(path)
     # Además, cualquier VTT con el alias de ID o categoría+número+fecha.
     for path in course_dir.rglob("*.vtt"):
-        if _in_backup(path, course_dir):
+        if _in_backup(path, course_dir) or (meta and _name_conflicts_with(path.name, meta)):
             continue
         if _file_matches(path, alias_ids, date, prefix, number):
             candidates.add(path)
@@ -339,11 +357,15 @@ def _has_whisper_transcript(
     candidates = _recording_transcripts(course_dir, rec_id, rec_info, meta)
     if expected_transcript and expected_transcript.is_file():
         candidates.append(expected_transcript)
-    return any(_is_correct_whisper_transcript(transcript) for transcript in candidates)
+    return any(
+        _video_slot(transcript) == _video_slot(expected_transcript)
+        and _is_correct_whisper_transcript(transcript)
+        for transcript in candidates
+    )
 
 
-def _existing_video(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | None = None) -> Path | None:
-    """Video de una grabación: organized_files, alias de ID o categoría+fecha.
+def _existing_videos(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | None = None) -> list[Path]:
+    """Videos por slot: organized_files, alias de ID o categoría+fecha.
 
     El fallback por categoría+fecha evita transcribir el video equivocado cuando
     las clases ya tienen nombres limpios (sin rec_id). Se excluye el respaldo.
@@ -358,6 +380,8 @@ def _existing_video(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | 
     organized = []
     for relative_path in rec_info.get("organized_files", []):
         candidate = course_dir / relative_path
+        if meta and _name_conflicts_with(candidate.name, meta):
+            continue
         if candidate.is_file() and candidate.suffix.lower() in video_extensions and not _in_backup(candidate, course_dir):
             organized.append(candidate)
     alias_candidates = []
@@ -365,7 +389,7 @@ def _existing_video(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | 
     for candidate in course_dir.rglob("*"):
         if not candidate.is_file() or candidate.suffix.lower() not in video_extensions:
             continue
-        if _in_backup(candidate, course_dir):
+        if _in_backup(candidate, course_dir) or (meta and _name_conflicts_with(candidate.name, meta)):
             continue
         if any(f"[{alias}" in candidate.name for alias in alias_ids):
             alias_candidates.append(candidate)
@@ -373,10 +397,26 @@ def _existing_video(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | 
             category_candidates.append(candidate)
     # Prioridad: alias de ID (inequívoco), luego categoría+número+fecha (nombres
     # limpios) y por último organized_files (asociación propia).
+    slots = {}
     for group in (alias_candidates, category_candidates, organized):
-        if group:
-            return group[0]
-    return None
+        for path in sorted(group):
+            slots.setdefault(_video_slot(path), path)
+    return [slots[slot] for slot in sorted(slots, key=lambda slot: slot or 0)]
+
+
+def _video_slot(path: Path | None) -> int | None:
+    parts = _split_part(path.name)[1] if path is not None else ()
+    return parts[-1] if parts else None
+
+
+def _whisper_destination(course_dir: Path, meta: dict, video: Path | None) -> Path:
+    """El whisper sigue el slot de su video: '... - Parte N.whisper.transcript.vtt'."""
+    part = _video_slot(video)
+    label = f" - Parte {part}" if part else ""
+    return (
+        course_dir / "transcripts" / "whisper"
+        / f"{recording_filename(meta)}{label}.whisper.transcript.vtt"
+    )
 
 
 def has_zoom_transcripts(work_dir: Path, course_slugs: list[str] | None = None) -> bool:
@@ -403,13 +443,17 @@ def has_zoom_transcripts(work_dir: Path, course_slugs: list[str] | None = None) 
 def transcribe_all(
     work_dir: Path,
     course_slugs: list[str] | None = None,
-    keep_zoom_transcripts: bool = False,
+    keep_zoom_transcripts: bool = True,
     settings: "WhisperSettings | None" = None,
     class_numbers: "set[int] | list[int] | None" = None,
+    *,
+    only_missing: bool = False,
+    check_only: bool = False,
 ) -> tuple[int, int]:
-    """Transcribe con Whisper las grabaciones seleccionadas sin transcript Whisper previo.
+    """Transcribe cada slot de video seleccionado sin transcript Whisper previo.
 
     `course_slugs` limita a cursos concretos; `class_numbers` limita a clases concretas.
+    `only_missing` conserva los slots con subtitulos Zoom; `check_only` solo lista.
     """
     settings = settings or WhisperSettings()
     class_numbers = set(class_numbers) if class_numbers else None
@@ -418,7 +462,6 @@ def transcribe_all(
     selected_courses = course_slugs or list(recordings)
     download_dir = work_dir / "downloads"
     cache_dir = work_dir / ".media-cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
     id_map = _build_rec_id_map(recordings, _course_options(work_dir))
 
     pending = []
@@ -432,21 +475,29 @@ def transcribe_all(
             metadata = id_map[rec_id]
             if class_numbers is not None and metadata.get("class_number") not in class_numbers:
                 continue
-            expected_transcript = (
-                course_dir / "transcripts" / "whisper"
-                / recording_filename(metadata, ".whisper.transcript.vtt")
-            )
-            if not rec_info.get("url"):
-                continue
-            if _has_whisper_transcript(course_dir, rec_id, rec_info, expected_transcript, metadata):
-                already_done += 1
-            else:
-                pending.append((slug, rec_id, rec_info))
+            for video in _existing_videos(course_dir, rec_id, rec_info, metadata) or [None]:
+                destination = _whisper_destination(course_dir, metadata, video)
+                done = (
+                    has_transcript(course_dir, rec_id, rec_info, metadata, video)
+                    if only_missing else
+                    _has_whisper_transcript(course_dir, rec_id, rec_info, destination, metadata)
+                )
+                if done:
+                    already_done += 1
+                elif video is not None or rec_info.get("url"):
+                    pending.append((slug, rec_id, rec_info, video, destination))
 
-    log(f"{already_done} grabaciones ya transcritas correctamente; se omiten.")
+    log(f"{already_done} slots de video ya transcritos correctamente; se omiten.")
     if not pending:
         log("Todas las grabaciones seleccionadas ya tienen transcripción de faster-whisper.")
         return 0, 0
+
+    if check_only:
+        for slug, _rec_id, _rec_info, _video, destination in pending:
+            log(f"  - [{slug}] {destination.name}")
+        return 0, 0
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         from faster_whisper import WhisperModel
@@ -455,7 +506,7 @@ def transcribe_all(
             "Falta faster-whisper. Instálalo con: pip install faster-whisper"
         ) from error
 
-    log(f"{len(pending)} grabaciones pendientes de transcripción local.")
+    log(f"{len(pending)} slots de video pendientes de transcripción local.")
     log(f"Cargando modelo {settings.model} ({settings.compute_type}, "
         f"device={settings.device}); el primer inicio descarga el modelo.")
     model = WhisperModel(
@@ -466,23 +517,26 @@ def transcribe_all(
     )
     ok = failed = 0
 
-    for slug, rec_id, rec_info in pending:
+    for slug, rec_id, rec_info, video, destination in pending:
         title = rec_info.get("title", slug)
         duration = rec_info.get("duration_minutes", 0)
-        label = f"[{slug}] {title} ({duration} min)"
+        label = f"[{slug}] {title} ({duration} min): {destination.name}"
         course_dir = download_dir / slug
         course_dir.mkdir(parents=True, exist_ok=True)
-        video = _existing_video(course_dir, rec_id, rec_info, id_map[rec_id])
         temporary_video = video is None
-        if temporary_video:
+        cache_key = hashlib.sha256(
+            f"{slug}\0{rec_id}\0{destination.name}".encode()
+        ).hexdigest()[:16]
+        wav = cache_dir / f"{slug}-{cache_key}.wav"
+        parts_dir = cache_dir / f"parts-{cache_key}"
+        if temporary_video and not wav.exists():
             log(f"Descargando video para transcribir: {label}")
             video = download_video({"url": rec_info["url"], "rec_id": rec_id}, cache_dir)
-        if not video:
+        if not video and not wav.exists():
             log(f"  ERROR descargando {label}")
             failed += 1
             continue
 
-        wav = cache_dir / f"{slug}-{hashlib.sha256(rec_id.encode()).hexdigest()[:16]}.wav"
         if not wav.exists():
             log(f"  Extrayendo audio: {video.name}")
             extracted = extract_audio(video, remove_video=temporary_video)
@@ -493,12 +547,7 @@ def transcribe_all(
             if extracted != wav:
                 extracted.replace(wav)
 
-        destination = (
-            course_dir / "transcripts" / "whisper"
-            / recording_filename(id_map[rec_id], ".whisper.transcript.vtt")
-        )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        parts_dir = cache_dir / f"parts-{hashlib.sha256(rec_id.encode()).hexdigest()[:16]}"
         log(f"  Transcribiendo con faster-whisper: {label}")
         try:
             transcribe(model, wav, destination, parts_dir, settings)
@@ -515,6 +564,8 @@ def transcribe_all(
             continue
         wav.unlink(missing_ok=True)
         for previous_transcript in _recording_transcripts(course_dir, rec_id, rec_info, id_map[rec_id]):
+            if _video_slot(previous_transcript) != _video_slot(destination):
+                continue
             is_whisper = _is_whisper_file(previous_transcript)
             if previous_transcript != destination and (is_whisper or not keep_zoom_transcripts):
                 previous_transcript.unlink(missing_ok=True)
@@ -575,10 +626,11 @@ def main():
     work_dir = Path(args.work_dir)
     if args.always_whisper:
         keep_zoom = args.keep_zoom_transcripts
-        if not keep_zoom and has_zoom_transcripts(work_dir, args.courses):
+        if not args.check and not keep_zoom and has_zoom_transcripts(work_dir, args.courses):
             keep_zoom = input("¿Conservar también las transcripciones originales de Zoom? [S/n]: ").strip().lower() not in {"n", "no"}
         ok, failed = transcribe_all(
-            work_dir, args.courses, keep_zoom, settings, args.class_numbers
+            work_dir, args.courses, keep_zoom, settings, args.class_numbers,
+            check_only=args.check,
         )
         if ok:
             recordings_path = work_dir / "recordings.json"
@@ -592,70 +644,24 @@ def main():
                 encoding="utf-8",
             )
         sys.exit(1 if failed else 0)
-    recordings, missing = find_missing(work_dir)
+    recordings, missing = find_missing(work_dir, args.courses, args.class_numbers)
 
     if not missing:
         log("Todas las grabaciones tienen transcripción. Nada que hacer.")
         return
 
-    log(f"{len(missing)} grabaciones sin transcripción:")
+    log(f"{len(missing)} slots de video sin transcripción:")
     for rec in missing:
         log(f"  - [{rec['slug']}] {rec['title']} ({rec['duration']} min)")
 
     if args.check:
         return
 
-    cache_dir = work_dir / ".media-cache"
-    cache_dir.mkdir(exist_ok=True)
-
-    from faster_whisper import WhisperModel
-    log(f"Cargando modelo {settings.model} ({settings.compute_type})...")
-    model = WhisperModel(settings.model, device=settings.device,
-                         compute_type=settings.compute_type, cpu_threads=settings.cpu_threads)
-
-    ok, failed = 0, 0
-    for rec in missing:
-        label = f"[{rec['slug']}] {rec['title']} ({rec['duration']} min)"
-
-        # Reanudación: si el wav ya está en cache (corrida anterior), no
-        # volver a descargar ni extraer.
-        existing = [p for p in cache_dir.glob("*.wav") if rec["rec_id"] in p.name]
-        if existing:
-            wav = existing[0]
-            log(f"Reutilizando audio en cache: {wav.name}")
-        else:
-            log(f"Descargando video: {label}")
-            video = download_video(rec, cache_dir)
-            if not video:
-                log(f"  ERROR descargando {label}, se omite")
-                failed += 1
-                continue
-            log(f"  Extrayendo audio de {video.name}")
-            wav = extract_audio(video)
-            if not wav:
-                log(f"  ERROR extrayendo audio de {label}, se omite")
-                failed += 1
-                continue
-
-        dest = work_dir / "downloads" / rec["slug"] / f"{wav.stem}.transcript.vtt"
-        parts_dir = cache_dir / f"parts-{rec['rec_id'].split('.')[0][:16]}"
-        log(f"  Transcribiendo (esto puede tardar ~{rec['duration']} min)...")
-        try:
-            transcribe(model, wav, dest, parts_dir, settings)
-        except Exception as e:
-            log(f"  ERROR transcribiendo {label}: {e} (el wav y los bloques "
-                "quedan en cache para reanudar)")
-            failed += 1
-            continue
-        wav.unlink(missing_ok=True)  # solo tras escribir el VTT completo
-
-        log(f"  OK -> {dest.name}")
-        ok += 1
-        # Integrar al proceso normal tras cada grabación (progreso incremental)
+    ok, failed = transcribe_all(
+        work_dir, args.courses, True, settings, args.class_numbers, only_missing=True,
+    )
+    if ok:
         copy_transcripts(work_dir / "downloads", recordings, _course_options(work_dir))
-        log("  index.json y transcripts/ regenerados")
-
-    log(f"Terminado: {ok} transcritas, {failed} fallidas.")
     sys.exit(1 if failed else 0)
 
 

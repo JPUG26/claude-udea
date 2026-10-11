@@ -46,6 +46,8 @@ Todo en un solo comando: `claude_udea`
 - **Deduplicacion por contenido** -- compara SHA-256 y respalda copias idénticas en vez de borrarlas
 - **Recuperación de videos faltantes** -- re-descarga un video ausente aunque el registro o el archive lo marquen como descargado
 - **Partes reales** -- conserva videos distintos de una misma sesión como `Clase #N - fecha - Parte M.mp4`
+- **Reparación de nombres y duplicados** -- `--repair-videos --dry-run` previsualiza; al aplicar normaliza `Parte N`, respalda copias y vuelve a solicitar solo subtítulos Zoom faltantes
+- **Transcripciones por parte** -- `.cc.vtt`, `.transcript.vtt`, `.chapter.vtt` y `.whisper.transcript.vtt` mantienen la misma fecha y parte que su video
 - **Numeración independiente** -- Arquitectura de Software y Fábrica Escuela tienen secuencias separadas
 - **Transcripción local opcional** -- faster-whisper procesa grabaciones sin subtítulos de Zoom
 - **Cross-platform** -- funciona en Windows, macOS y Linux (incluido Raspberry Pi headless)
@@ -272,9 +274,27 @@ claude_udea --sync-materials  # Solo materiales Moodle; no descarga grabaciones
 claude_udea --skip-materials  # Omitir materiales en el flujo normal
 claude_udea --sync-ingenia-materials "https://ingenia.udea.edu.co/campus/course/view.php?id=215"
 claude_udea --always-whisper --skip-video # Crear VTT con faster-whisper
+claude_udea --repair-videos --dry-run    # Previsualizar reparación de nombres y duplicados
+claude_udea --repair-videos             # Reparar archivos del curso sin scrapear ni abrir asistente
 ```
 
 En cada carpeta `downloads/<curso>/` los archivos se separan en `videos/`, `transcripts/zoom/` y `transcripts/whisper/`. Los archivos de chat de Zoom no se descargan: la plataforma no los expone de forma fiable para cada grabación.
+
+### Reparar videos y transcripciones de Zoom
+
+La numeración `Parte N` corresponde a una pieza de video distinta de una misma clase. Sus archivos `.cc.vtt`, `.transcript.vtt`, `.chapter.vtt` y `.whisper.transcript.vtt` conservan el mismo slot; los subtítulos no generan números de parte por separado. Si los metadatos guardan rutas antiguas, la fecha y la categoría del nombre canónico se usan para no atribuir archivos de otra clase.
+
+```bash
+# Revisar qué se movería, renombraría o pondría en cuarentena
+claude_udea --repair-videos --dry-run arquitectura-de-software
+
+# Aplicar la reparación de un curso (también acepta varios slugs)
+claude_udea --repair-videos arquitectura-de-software
+```
+
+La reparación detecta nombres repetidos como `Parte 1 - Parte 1`, duplicados byte a byte, subtítulos Zoom copiados entre clases y grabaciones vacías. Los archivos retirados se conservan en `.claude-udea-backup/<motivo>/` junto con un `manifest.jsonl`; los movimientos se registran también en `repair-manifest.jsonl`. La reasignación entre clases requiere una fecha interna verificable con ffprobe. Si un video se reasigna, sus subtítulos antiguos se respaldan: compartir un número de parte no prueba que pertenezcan al video. Los subtítulos Zoom retirados se vuelven a solicitar sin descargar de nuevo el video. Los clips cortos válidos se conservan y se reportan, en vez de clasificarse automáticamente como vacíos. La misma revisión preventiva también ocurre al final del flujo normal.
+
+La vista previa no mueve archivos ni actualiza `recordings.json`. Antes de aplicar `--repair-videos`, el comando guarda una copia fechada de `recordings.json`; los cursos no seleccionados no se reorganizan ni se sobrescriben en el índice central. El reporte no reasigna contenido ambiguo: deja videos para revisión y respalda subtítulos cuya relación con el video no puede comprobarse. Se recomienda revisar el reporte antes de aplicar y conservar las carpetas de respaldo hasta verificar los nombres y contenidos.
 
 El comando de Ingenia solicita usuario y contraseña directamente en la terminal si no existe una sesión válida. Los datos se guardan separados de Moodle en Windows Credential Manager. La cuenta debe estar matriculada en el curso; el scraper no intenta comprar ni matricularse.
 
@@ -344,9 +364,15 @@ C:\claude-udea\                   # Windows
 |       +-- taller.md
 +-- downloads/
     |-- calidad-de-software/      # Archivos descargados por asignatura
-    |   |-- videos/               # Videos organizados por clase
-    |   +-- .claude-udea-backup/  # Copias idénticas respaldadas (SHA-256)
-    |       +-- identical-videos/ # Contenido duplicado + manifest.jsonl
+    |   |-- videos/               # Videos organizados por clase y parte
+    |   |-- transcripts/
+    |   |   |-- zoom/             # .cc.vtt, .transcript.vtt y .chapter.vtt
+    |   |   +-- whisper/          # Una transcripción por cada slot de video
+    |   +-- .claude-udea-backup/  # Duplicados, huérfanos y archivos dudosos
+    |       |-- identical-videos/
+    |       |-- misassigned-videos/
+    |       |-- misassigned-transcripts/
+    |       +-- empty-videos/
     |-- ingenieria-web/
     +-- transcripts/              # Transcripciones organizadas
         |-- index.json            # Indice por fecha y asignatura
@@ -357,13 +383,13 @@ C:\claude-udea\                   # Windows
             +-- ...
 ```
 
-Las credenciales y cookies no se guardan como archivos en claro: se almacenan en el almacén seguro del sistema operativo. Los nombres de grabaciones incluyen número y fecha; Arquitectura de Software y Fábrica Escuela mantienen secuencias independientes. `downloads/transcripts/index.json` contiene metadata por asignatura.
+Las credenciales y cookies no se guardan como archivos en claro: se almacenan en el almacén seguro del sistema operativo. Los nombres de grabaciones incluyen número y fecha; Arquitectura de Software y Fábrica Escuela mantienen secuencias independientes. `downloads/transcripts/index.json` contiene metadata por asignatura, incluyendo el número de parte.
 
-Cuando el organizador encuentra videos idénticos (mismo tamaño y hash SHA-256), mueve las copias a `downloads/<curso>/.claude-udea-backup/identical-videos/` y registra origen, destino y hash en un `manifest.jsonl`, en vez de borrarlas. Los videos de una misma sesión con contenido distinto se conservan como `Clase #N - fecha - Parte M.mp4`.
+Cuando el organizador encuentra videos idénticos (mismo tamaño y hash SHA-256), mueve las copias a `downloads/<curso>/.claude-udea-backup/identical-videos/` y registra origen, destino y hash en un `manifest.jsonl`, en vez de borrarlas. Los videos de una misma sesión con contenido distinto se conservan como `Clase #N - fecha - Parte M.mp4`. Las transcripciones Zoom y Whisper usan ese mismo slot; una transcripción no crea su propia parte. Los nombres anidados heredados se normalizan desde la base canónica, por ejemplo `Clase #15 - 2026-09-29 - Parte 1 - Parte 1.mp4` deja de acumular sufijos.
 
   ## Transcribir grabaciones sin subtítulos
 
-  `transcribe_missing.py` genera transcripciones locales con faster-whisper para grabaciones que no tienen `.transcript.vtt` ni `.cc.vtt`. Procesa el audio por bloques, permite reanudar una ejecución interrumpida y actualiza `downloads/transcripts/` y su índice.
+  `transcribe_missing.py` genera transcripciones locales con faster-whisper para cada video o parte que aún no tenga su propio `.whisper.transcript.vtt`. Procesa el audio por bloques, permite reanudar cada slot interrumpido y actualiza `downloads/transcripts/` y su índice. Un Whisper de la parte 2 no cuenta como transcripción del video principal ni de la parte 1.
 
   Instala faster-whisper y FFmpeg (incluido ffprobe), y lista las grabaciones pendientes:
 
@@ -372,7 +398,7 @@ Cuando el organizador encuentra videos idénticos (mismo tamaño y hash SHA-256)
   python transcribe_missing.py --work-dir /ruta/a/claude-udea --check
   ```
 
-  Quita `--check` para transcribir. El script actual está orientado a Linux: usa `.venv/bin/yt-dlp` y su directorio de trabajo predeterminado es `/home/gabo/claude-udea`. En otros entornos se deben adaptar esas rutas antes de ejecutarlo.
+  Para procesar solo las partes sin subtítulos Zoom se puede usar `--only-missing`; `--check` lista cada slot pendiente sin cargar el modelo. El directorio predeterminado depende del sistema (en Windows, `C:\\claude-udea`); también se puede indicar con `--work-dir`.
 
   ## Materiales Moodle
 

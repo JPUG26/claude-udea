@@ -432,6 +432,34 @@ def _usable_media_file(path: Path) -> bool:
         return False
 
 
+def _guard_meta(rec_info: dict, fabrica_meeting_ids: set | None) -> dict:
+    from claude_udea.download import _class_category_for
+    return {
+        "start_date": rec_info.get("start_date", ""),
+        "class_category": _class_category_for(rec_info, fabrica_meeting_ids),
+    }
+
+
+def _owned_organized_files(rec_info: dict, fabrica_meeting_ids: set | None) -> list[str]:
+    """organized_files sin rutas obsoletas que apuntan a otra fecha/categoría."""
+    from claude_udea.download import _name_conflicts_with
+    meta = _guard_meta(rec_info, fabrica_meeting_ids)
+    return [
+        relative_name for relative_name in rec_info.get("organized_files", [])
+        if not _name_conflicts_with(Path(relative_name).name, meta)
+    ]
+
+
+def _skip_reason(rec_info: dict) -> str:
+    """Motivo para no (re)descargar una grabación, o '' si debe intentarse."""
+    if rec_info.get("empty_recording"):
+        return "grabación vacía"
+    url = rec_info.get("url") or rec_info.get("share_url", "")
+    if rec_info.get("suspect_url") and rec_info["suspect_url"] == url:
+        return "URL sospechosa (devolvió contenido de otra clase)"
+    return ""
+
+
 def _has_video_artifact(course_dir: Path, rec_info: dict, rec_id: str, fabrica_meeting_ids: set | None = None) -> bool:
     """True only when a complete video file for this recording exists on disk."""
     from claude_udea.download import _recording_alias_ids
@@ -439,7 +467,7 @@ def _has_video_artifact(course_dir: Path, rec_info: dict, rec_id: str, fabrica_m
     video_extensions = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
     alias_ids = _recording_alias_ids(rec_id, rec_info)
     candidates = []
-    for relative_name in rec_info.get("organized_files", []):
+    for relative_name in _owned_organized_files(rec_info, fabrica_meeting_ids):
         path = course_dir / relative_name
         if path.suffix.lower() in video_extensions:
             candidates.append(path)
@@ -477,23 +505,31 @@ def _recording_video_missing(course_dir: Path, rec_info: dict, rec_id: str, fabr
 
 
 def _recording_subs_present(course_dir: Path, rec_info: dict, fabrica_meeting_ids: set | None = None) -> bool:
-    """True si ya existen subtítulos (VTT) organizados para esta grabación."""
-    for relative_name in rec_info.get("organized_files", []):
-        if relative_name.lower().endswith(".vtt"):
-            if _usable_media_file(course_dir / relative_name):
-                return True
+    """True si ya existen subtítulos de Zoom (.cc/.transcript, no whisper) para esta grabación."""
+    from claude_udea.download import _is_zoom_sub, _parse_date_prefix
 
-    start_date = rec_info.get("start_date", "")
-    date_prefix = start_date[:10] if start_date else ""
-    if not date_prefix or not date_prefix[0].isdigit():
+    for relative_name in _owned_organized_files(rec_info, fabrica_meeting_ids):
+        if _is_zoom_sub(relative_name) and _usable_media_file(course_dir / relative_name):
+            return True
+
+    date_prefix = _parse_date_prefix(rec_info.get("start_date", ""))
+    if date_prefix == "sin-fecha":
         return False
     category_prefix = _category_prefix_for(rec_info, fabrica_meeting_ids)
     date_marker = f" - {date_prefix}"
     for path in course_dir.rglob("*.vtt"):
         name = path.name.casefold()
-        if name.startswith(category_prefix) and date_marker in name and _usable_media_file(path):
+        if (
+            _is_zoom_sub(name) and name.startswith(category_prefix)
+            and date_marker in name and _usable_media_file(path)
+        ):
             return True
     return False
+
+
+def _needs_subs_redownload(rec_info: dict) -> bool:
+    url = rec_info.get("url") or rec_info.get("share_url", "")
+    return bool(url and rec_info.get("zoom_subs_missing") and not _skip_reason(rec_info))
 
 
 def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, skip_video, dry_run, skip_scrape=False):
@@ -577,6 +613,8 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 for item in new_pending:
                     _, rec_id, _, _ = item
                     rec_info = item[2]
+                    if _skip_reason(rec_info):
+                        continue
                     if skip_video or _recording_video_missing(download_dir / slug, rec_info, rec_id, fabrica_ids):
                         pending.append(item)
                     else:
@@ -585,10 +623,12 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                 # También agregar pendientes de ejecuciones previas
                 if slug in existing:
                     for rec_id, rec_info in existing[slug].get("recordings", {}).items():
+                        if _skip_reason(rec_info):
+                            continue
                         video_present = not _recording_video_missing(download_dir / slug, rec_info, rec_id, fabrica_ids)
+                        url = rec_info.get("url") or rec_info.get("share_url", "")
                         if not skip_video and video_present:
                             continue
-                        url = rec_info.get("url") or rec_info.get("share_url", "")
                         if url and not any(p[1] == rec_id for p in pending):
                             pending.append((slug, rec_id, rec_info, url))
 
@@ -612,13 +652,15 @@ def fase_scraping_y_descarga(work_dir, config, recordings_path, target_courses, 
                     continue
                 fabrica_ids = _fabrica_ids_for(config, slug)
                 for rec_id, rec_info in existing[slug].get("recordings", {}).items():
+                    if _skip_reason(rec_info):
+                        continue
                     video_present = not _recording_video_missing(download_dir / slug, rec_info, rec_id, fabrica_ids)
+                    url = rec_info.get("url") or rec_info.get("share_url", "")
+                    course_dir = download_dir / slug
                     if not skip_video and video_present:
                         already += 1
                         continue
-                    url = rec_info.get("url") or rec_info.get("share_url", "")
                     if url:
-                        course_dir = download_dir / slug
                         skip_subs = (not skip_video) and _recording_subs_present(course_dir, rec_info, fabrica_ids)
                         df = pool.submit(download_one, url, course_dir, archive_path, skip_video, dry_run, skip_subs)
                         download_futures.append((slug, rec_id, rec_info, df))
@@ -688,15 +730,154 @@ def _get_assistant(config) -> str:
     return config.get("assistant", "claude")
 
 
+def _run_repair(config, recordings, target_courses, dry_run=False, verbose=False) -> dict:
+    """Ejecuta repair_course en los cursos seleccionados y devuelve totales."""
+    from claude_udea.download import _build_rec_id_map, repair_course
+
+    download_dir = Path(config["download_dir"])
+    all_id_map = _build_rec_id_map(recordings, config.get("courses", {}))
+    totals = {"backup": 0, "rename": 0, "reassign": 0, "warnings": 0, "subs": 0, "empty": 0}
+    for slug in target_courses:
+        if slug not in recordings:
+            continue
+        id_map = {
+            rec_id: meta for rec_id, meta in all_id_map.items()
+            if meta.get("slug") == slug
+        }
+        report = repair_course(download_dir / slug, recordings[slug], id_map, dry_run=dry_run)
+        for kind, *_ in report["actions"]:
+            totals[kind] = totals.get(kind, 0) + 1
+        totals["warnings"] += len(report["warnings"])
+        totals["empty"] += sum(1 for flags in report["flags"].values() if flags.get("empty_recording"))
+        totals["subs"] += sum(1 for flags in report["flags"].values() if flags.get("zoom_subs_missing"))
+        if not verbose or not (report["actions"] or report["warnings"]):
+            continue
+        print(f"\n  [{slug}]")
+        for kind, first, second, extra in report["actions"]:
+            if kind == "backup":
+                print(f"    respaldo ({second}): {first}")
+            elif kind == "rename":
+                print(f"    renombrar: {first}\n            -> {second}")
+            else:
+                print(f"    reasignar ({extra}): {first} -> {second}")
+        for warning in report["warnings"]:
+            print(f"    ⚠ {warning}")
+        for rec_id, flags in report["flags"].items():
+            names = ", ".join(sorted(flag for flag, value in flags.items() if value))
+            if not names:
+                continue
+            print(f"    marca {names}: {id_map.get(rec_id, {}).get('class_number', '?')} ({rec_id[:12]}…)")
+    return totals
+
+
+def _print_repair_totals(totals: dict, dry_run: bool) -> None:
+    prefix = "Plan de reparación" if dry_run else "Reparación"
+    print(
+        f"  ✔ {prefix}: {totals['backup']} a respaldo, {totals['rename']} renombrados, "
+        f"{totals['reassign']} reasignados, {totals['subs']} clases sin subtítulos Zoom "
+        f"(se re-descargan), {totals['empty']} grabaciones vacías, "
+        f"{totals['warnings']} advertencias"
+    )
+
+
+def _redownload_missing_subs(config, recordings, target_courses) -> int:
+    """Re-descarga solo subtítulos de las grabaciones marcadas `zoom_subs_missing`."""
+    from claude_udea.download import download_one, get_archive_path
+
+    download_dir = Path(config["download_dir"])
+    archive_path = get_archive_path(download_dir)
+    recovered = 0
+    for slug in target_courses:
+        for rec_id, rec_info in recordings.get(slug, {}).get("recordings", {}).items():
+            if not _needs_subs_redownload(rec_info):
+                continue
+            url = rec_info.get("url") or rec_info.get("share_url", "")
+            status = download_one(url, download_dir / slug, archive_path, True, False, False, True)
+            if status == "ok":
+                recovered += 1
+    return recovered
+
+
+def repair_videos_command(config, target_courses, dry_run=False) -> None:
+    """`claude_udea --repair-videos [--dry-run] [curso...]`."""
+    from claude_udea.download import copy_transcripts, rename_downloads
+
+    recordings_path = Path(config["recordings_file"])
+    recordings = load_recordings(recordings_path)
+    if not recordings:
+        print("  No hay datos previos (recordings.json vacío).\n")
+        return
+    if not dry_run:
+        import shutil
+        backup_path = recordings_path.with_name(
+            f"{recordings_path.name}.antes-repair-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+        )
+        shutil.copy2(recordings_path, backup_path)
+        print(f"  Respaldo de metadatos: {backup_path}")
+    totals = _run_repair(config, recordings, target_courses, dry_run=dry_run, verbose=True)
+    print()
+    _print_repair_totals(totals, dry_run)
+    if dry_run:
+        print("  (--dry-run: no se movió ningún archivo)\n")
+        return
+    download_dir = Path(config["download_dir"])
+    course_options = config.get("courses", {})
+    selected = {slug: recordings[slug] for slug in target_courses if slug in recordings}
+    rename_downloads(download_dir, selected, course_options)
+    save_recordings(recordings_path, recordings)
+    missing_subs = sum(
+        1 for slug in target_courses
+        for rec_info in recordings.get(slug, {}).get("recordings", {}).values()
+        if rec_info.get("zoom_subs_missing") and not rec_info.get("empty_recording")
+    )
+    if missing_subs:
+        print("  Re-descargando subtítulos de Zoom de las clases marcadas...")
+        recovered = _redownload_missing_subs(config, recordings, target_courses)
+        print(f"  ✔ Subtítulos recuperados en {recovered} clases")
+        rename_downloads(download_dir, selected, course_options)
+        for slug in target_courses:
+            fabrica_ids = _fabrica_ids_for(config, slug)
+            for rec_info in recordings.get(slug, {}).get("recordings", {}).values():
+                if rec_info.get("zoom_subs_missing") and _recording_subs_present(
+                    download_dir / slug, rec_info, fabrica_ids,
+                ):
+                    rec_info.pop("zoom_subs_missing", None)
+    copy_transcripts(download_dir, recordings, course_options, course_slugs=target_courses)
+    save_recordings(recordings_path, recordings)
+    print()
+
+
 def fase_final(config, recordings, target_courses, assistant_override=None, ollama_model=None):
     from claude_udea.download import copy_transcripts, count_transcripts, rename_downloads
 
     download_dir = Path(config["download_dir"])
     course_options = config.get("courses", {})
 
+    repair_totals = _run_repair(config, recordings, target_courses, verbose=True)
+    if any(repair_totals[key] for key in ("backup", "rename", "reassign")):
+        _print_repair_totals(repair_totals, dry_run=False)
+
     with Spinner("Organizando transcripciones..."):
-        rename_downloads(download_dir, recordings, course_options)
-        copy_transcripts(download_dir, recordings, course_options)
+        selected = {slug: recordings[slug] for slug in target_courses if slug in recordings}
+        rename_downloads(download_dir, selected, course_options)
+        missing_subs = any(
+            rec_info.get("zoom_subs_missing") and not rec_info.get("empty_recording")
+            for slug in target_courses
+            for rec_info in recordings.get(slug, {}).get("recordings", {}).values()
+        )
+        if missing_subs:
+            print("  Re-descargando subtítulos Zoom de las grabaciones recuperables...")
+            recovered = _redownload_missing_subs(config, recordings, target_courses)
+            rename_downloads(download_dir, selected, course_options)
+            for slug in target_courses:
+                fabrica_ids = _fabrica_ids_for(config, slug)
+                for rec_info in recordings.get(slug, {}).get("recordings", {}).values():
+                    if rec_info.get("zoom_subs_missing") and _recording_subs_present(
+                        download_dir / slug, rec_info, fabrica_ids,
+                    ):
+                        rec_info.pop("zoom_subs_missing", None)
+            print(f"  ✔ Subtítulos recuperados en {recovered} clases")
+        copy_transcripts(download_dir, recordings, course_options, course_slugs=target_courses)
         save_recordings(Path(config["recordings_file"]), recordings)
 
     total_vtts = 0
@@ -839,7 +1020,8 @@ def main():
     from claude_udea.ollama_chat import parse_ollama_model_flag
     args, ollama_model = parse_ollama_model_flag(sys.argv[1:])
     use_ollama = "--ollama" in args
-    no_assistant = "--no-assistant" in args or "--no-claude" in args
+    repair_only = "--repair-videos" in args
+    no_assistant = "--no-assistant" in args or "--no-claude" in args or repair_only
     if use_ollama and no_assistant:
         print("  Usa --ollama o --no-assistant, no ambos.\n")
         sys.exit(2)
@@ -888,32 +1070,48 @@ def main():
 
     # Validar dependencias
     from claude_udea.deps import check_and_install
-    if not check_and_install(
+    if not (repair_only and "--dry-run" in args) and not check_and_install(
         skip_assistant=use_ollama or no_assistant,
         require_whisper="--always-whisper" in args,
     ):
         sys.exit(1)
 
-    import questionary
-    from questionary import Style
-
-    work_dir = _get_work_dir()
+    work_dir = WORK_DIR if repair_only else _get_work_dir()
 
     config = load_config(work_dir)
     recordings_path = Path(config["recordings_file"])
     download_dir = Path(config["download_dir"])
 
+    dry_run = "--dry-run" in args
+    if repair_only:
+        course_args = [
+            arg for index, arg in enumerate(args)
+            if not arg.startswith("--")
+            and (index == 0 or args[index - 1] not in {"--whisper-model", "--whisper-compute-type", "--whisper-device", "--whisper-cpu-threads", "--whisper-beam-size", "--whisper-language", "--whisper-initial-prompt", "--whisper-chunk-seconds"})
+        ]
+        all_courses = list(config["courses"].keys())
+        unknown = [slug for slug in course_args if slug not in config["courses"]]
+        if unknown:
+            print(f"  Asignaturas no encontradas: {', '.join(unknown)}")
+            print(f"  Disponibles: {', '.join(all_courses)}\n")
+            sys.exit(2)
+        print("\n  UdeA Zoom → Transcripciones → AI\n")
+        repair_videos_command(config, course_args or all_courses, dry_run=dry_run)
+        return
+
+    import questionary
+    from questionary import Style
+
     from claude_udea.download import get_archive_path
     archive_path = get_archive_path(download_dir)
 
     # Flags
-    dry_run = "--dry-run" in args
     status_only = "--status" in args
-    skip_scrape = "--skip-scrape" in args
+    skip_scrape = "--skip-scrape" in args or repair_only
     skip_video_flag = "--skip-video" in args
     download_all_flag = "--all" in args
     add_course_flag = "--add-course" in args
-    skip_materials = "--skip-materials" in args
+    skip_materials = "--skip-materials" in args or repair_only
     always_whisper = "--always-whisper" in args
 
     if add_course_flag:
