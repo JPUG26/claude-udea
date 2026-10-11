@@ -545,16 +545,20 @@ def rename_downloads(download_dir: Path, recordings: dict, course_options: dict 
                 if source.is_file():
                     organized_paths.append(source)
 
-            # Archivos ya organizados (sin tag [rec_id] en el nombre): se preservan tal cual.
-            already_organized = [
-                path for path in organized_paths if not _ID_MARKER_RE.search(path.name)
-            ]
-
+            already_organized = []
             sources = dict(loose_sources.get(rec_id, {}))
             for source in organized_paths:
                 # Nombres con tags viejos [rec_id] / [rec_id copy N]: re-normalizar.
                 if _ID_MARKER_RE.search(source.name):
                     sources[source] = _filename_suffix(source.name, rec_id)
+                    continue
+                # Nombres limpios: re-normalizar si no coinciden con el canónico actual
+                # (corrige fechas cambiadas, 'sin-fecha' y numeración obsoleta).
+                suffix = _filename_suffix(source.name, "")
+                if source.name == recording_filename(meta, suffix):
+                    already_organized.append(source)
+                else:
+                    sources[source] = suffix
 
             whisper_transcript = (
                 course_dir / "transcripts" / "whisper"
@@ -706,11 +710,15 @@ def _sweep_unclassified(course_dir: Path) -> None:
         else:
             category = "sin-clasificar"
         target_dir = course_dir / category
+        target_dir.mkdir(parents=True, exist_ok=True)
         destination = target_dir / entry.name
         if destination.exists():
-            print(f"  ⚠ Ya existe {destination.relative_to(course_dir.parent)}; no se mueve {entry.name}")
-            continue
-        target_dir.mkdir(parents=True, exist_ok=True)
+            # No dejar nada suelto en la raíz: si es idéntico se descarta el duplicado;
+            # si difiere se conserva con un sufijo único.
+            if _files_identical(entry, destination)[0]:
+                entry.unlink()
+                continue
+            destination = target_dir / f"{entry.stem} ({uuid.uuid4().hex[:8]}){entry.suffix}"
         entry.rename(destination)
 
 

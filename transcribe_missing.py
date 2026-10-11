@@ -34,9 +34,51 @@ sys.path.insert(0, str(TOOL_DIR))
 
 from claude_udea.download import (  # noqa: E402
     _build_rec_id_map,
+    _class_number_from_filename,
+    _recording_alias_ids,
     copy_transcripts,
     recording_filename,
 )
+
+_SKIP_PARTS = {".claude-udea-backup", "sin-clasificar", "incompletos"}
+
+
+def _course_options(work_dir: Path) -> dict:
+    """Opciones por curso (fabrica_meeting_ids) desde config.json."""
+    config_path = work_dir / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {
+        slug: {"fabrica_meeting_ids": info.get("fabrica_meeting_ids", [])}
+        for slug, info in data.get("courses", {}).items()
+    }
+
+
+def _in_backup(path: Path, course_dir: Path) -> bool:
+    try:
+        return any(part in _SKIP_PARTS for part in path.relative_to(course_dir).parts)
+    except ValueError:
+        return False
+
+
+def _category_prefix(meta: dict | None) -> str:
+    return "fabrica escuela - clase #" if (meta or {}).get("class_category") == "fabrica_escuela" else "clase #"
+
+
+def _file_matches(path: Path, alias_ids: list[str], date: str, prefix: str, number) -> bool:
+    """Empareja un archivo con su grabación por alias de ID o por categoría+número+fecha."""
+    name = path.name
+    if any(f"[{alias}" in name for alias in alias_ids):
+        return True
+    if not date or f" - {date}" not in name or not name.casefold().startswith(prefix):
+        return False
+    if number is not None:
+        return _class_number_from_filename(name) == number
+    return True
 
 MODEL_SIZE = "small"          # mejor balance calidad/velocidad en Pi 5 (~1x tiempo real)
 COMPUTE_TYPE = "int8"
@@ -60,8 +102,8 @@ def fmt_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def has_transcript(course_dir: Path, rec_id: str, rec_info: dict | None = None) -> bool:
-    return bool(_recording_transcripts(course_dir, rec_id, rec_info or {}))
+def has_transcript(course_dir: Path, rec_id: str, rec_info: dict | None = None, meta: dict | None = None) -> bool:
+    return bool(_recording_transcripts(course_dir, rec_id, rec_info or {}, meta))
 
 
 def find_missing(work_dir: Path):
@@ -70,11 +112,12 @@ def find_missing(work_dir: Path):
         recordings = json.load(f)
 
     download_dir = work_dir / "downloads"
+    id_map = _build_rec_id_map(recordings, _course_options(work_dir))
     missing = []
     for slug, course in recordings.items():
         course_dir = download_dir / slug
         for rec_id, info in course.get("recordings", {}).items():
-            if not has_transcript(course_dir, rec_id, info):
+            if not has_transcript(course_dir, rec_id, info, id_map.get(rec_id)):
                 missing.append({
                     "slug": slug,
                     "rec_id": rec_id,
@@ -176,14 +219,29 @@ def transcribe(model, wav: Path, dest_vtt: Path, parts_dir: Path):
     shutil.rmtree(parts_dir, ignore_errors=True)
 
 
-def _recording_transcripts(course_dir: Path, rec_id: str, rec_info: dict) -> list[Path]:
+def _recording_transcripts(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | None = None) -> list[Path]:
+    """VTTs de una grabación: por organized_files, por alias de ID y por categoría+fecha.
+
+    Las clases ya organizadas tienen nombres limpios (sin rec_id), así que se
+    emparejan además por prefijo de categoría y fecha. Se excluye el respaldo.
+    """
+    meta = meta or {}
+    alias_ids = _recording_alias_ids(rec_id, rec_info)
+    date = (rec_info.get("start_date", "") or "")[:10]
+    prefix = _category_prefix(meta)
+    number = meta.get("class_number")
+
     candidates = set()
+    # organized_files es la asociación propia de cada grabación: se confía en ella.
     for relative_path in rec_info.get("organized_files", []):
         path = course_dir / relative_path
-        if path.is_file() and path.suffix.lower() == ".vtt":
+        if path.is_file() and not _in_backup(path, course_dir):
             candidates.add(path)
+    # Además, cualquier VTT con el alias de ID o categoría+número+fecha.
     for path in course_dir.rglob("*.vtt"):
-        if rec_id in path.name:
+        if _in_backup(path, course_dir):
+            continue
+        if _file_matches(path, alias_ids, date, prefix, number):
             candidates.add(path)
     return [
         path for path in candidates
@@ -214,22 +272,48 @@ def _has_whisper_transcript(
     rec_id: str,
     rec_info: dict,
     expected_transcript: Path | None = None,
+    meta: dict | None = None,
 ) -> bool:
-    candidates = _recording_transcripts(course_dir, rec_id, rec_info)
+    candidates = _recording_transcripts(course_dir, rec_id, rec_info, meta)
     if expected_transcript and expected_transcript.is_file():
         candidates.append(expected_transcript)
     return any(_is_correct_whisper_transcript(transcript) for transcript in candidates)
 
 
-def _existing_video(course_dir: Path, rec_id: str, rec_info: dict) -> Path | None:
+def _existing_video(course_dir: Path, rec_id: str, rec_info: dict, meta: dict | None = None) -> Path | None:
+    """Video de una grabación: organized_files, alias de ID o categoría+fecha.
+
+    El fallback por categoría+fecha evita transcribir el video equivocado cuando
+    las clases ya tienen nombres limpios (sin rec_id). Se excluye el respaldo.
+    """
+    meta = meta or {}
     video_extensions = {".mp4", ".mkv", ".webm", ".mov"}
+    alias_ids = _recording_alias_ids(rec_id, rec_info)
+    date = (rec_info.get("start_date", "") or "")[:10]
+    prefix = _category_prefix(meta)
+    number = meta.get("class_number")
+
+    organized = []
     for relative_path in rec_info.get("organized_files", []):
         candidate = course_dir / relative_path
-        if candidate.is_file() and candidate.suffix.lower() in video_extensions:
-            return candidate
+        if candidate.is_file() and candidate.suffix.lower() in video_extensions and not _in_backup(candidate, course_dir):
+            organized.append(candidate)
+    alias_candidates = []
+    category_candidates = []
     for candidate in course_dir.rglob("*"):
-        if candidate.is_file() and rec_id in candidate.name and candidate.suffix.lower() in video_extensions:
-            return candidate
+        if not candidate.is_file() or candidate.suffix.lower() not in video_extensions:
+            continue
+        if _in_backup(candidate, course_dir):
+            continue
+        if any(f"[{alias}" in candidate.name for alias in alias_ids):
+            alias_candidates.append(candidate)
+        elif _file_matches(candidate, alias_ids, date, prefix, number):
+            category_candidates.append(candidate)
+    # Prioridad: alias de ID (inequívoco), luego categoría+número+fecha (nombres
+    # limpios) y por último organized_files (asociación propia).
+    for group in (alias_candidates, category_candidates, organized):
+        if group:
+            return group[0]
     return None
 
 
@@ -237,11 +321,12 @@ def has_zoom_transcripts(work_dir: Path, course_slugs: list[str] | None = None) 
     recordings_path = work_dir / "recordings.json"
     recordings = json.loads(recordings_path.read_text(encoding="utf-8"))
     download_dir = work_dir / "downloads"
+    id_map = _build_rec_id_map(recordings, _course_options(work_dir))
     for slug in course_slugs or list(recordings):
         course = recordings.get(slug, {})
         course_dir = download_dir / slug
         for rec_id, rec_info in course.get("recordings", {}).items():
-            for transcript in _recording_transcripts(course_dir, rec_id, rec_info):
+            for transcript in _recording_transcripts(course_dir, rec_id, rec_info, id_map.get(rec_id)):
                 try:
                     is_whisper = "generada localmente con faster-whisper" in transcript.read_text(
                         encoding="utf-8", errors="replace"
@@ -265,7 +350,7 @@ def transcribe_all(
     download_dir = work_dir / "downloads"
     cache_dir = work_dir / ".media-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    id_map = _build_rec_id_map(recordings)
+    id_map = _build_rec_id_map(recordings, _course_options(work_dir))
 
     pending = []
     already_done = 0
@@ -282,7 +367,7 @@ def transcribe_all(
             )
             if not rec_info.get("url"):
                 continue
-            if _has_whisper_transcript(course_dir, rec_id, rec_info, expected_transcript):
+            if _has_whisper_transcript(course_dir, rec_id, rec_info, expected_transcript, metadata):
                 already_done += 1
             else:
                 pending.append((slug, rec_id, rec_info))
@@ -315,7 +400,7 @@ def transcribe_all(
         label = f"[{slug}] {title} ({duration} min)"
         course_dir = download_dir / slug
         course_dir.mkdir(parents=True, exist_ok=True)
-        video = _existing_video(course_dir, rec_id, rec_info)
+        video = _existing_video(course_dir, rec_id, rec_info, id_map[rec_id])
         temporary_video = video is None
         if temporary_video:
             log(f"Descargando video para transcribir: {label}")
@@ -357,7 +442,7 @@ def transcribe_all(
             failed += 1
             continue
         wav.unlink(missing_ok=True)
-        for previous_transcript in _recording_transcripts(course_dir, rec_id, rec_info):
+        for previous_transcript in _recording_transcripts(course_dir, rec_id, rec_info, id_map[rec_id]):
             is_whisper = _is_whisper_file(previous_transcript)
             if previous_transcript != destination and (is_whisper or not keep_zoom_transcripts):
                 previous_transcript.unlink(missing_ok=True)
@@ -460,7 +545,7 @@ def main():
         log(f"  OK -> {dest.name}")
         ok += 1
         # Integrar al proceso normal tras cada grabación (progreso incremental)
-        copy_transcripts(work_dir / "downloads", recordings)
+        copy_transcripts(work_dir / "downloads", recordings, _course_options(work_dir))
         log("  index.json y transcripts/ regenerados")
 
     log(f"Terminado: {ok} transcritas, {failed} fallidas.")

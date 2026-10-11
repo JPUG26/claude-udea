@@ -266,11 +266,8 @@ def _merge_scraped(existing, config, slug, links):
 
     session_index = {}
     for rec_id, rec_info in course_data["recordings"].items():
-        session_key = (
-            str(rec_info.get("meeting_id", "") or ""),
-            str(rec_info.get("start_date", "") or ""),
-        )
-        if session_key[0] and session_key[1]:
+        session_key = str(rec_info.get("start_date", "") or "")
+        if session_key:
             session_index[session_key] = rec_id
 
     new_pending = []
@@ -281,12 +278,10 @@ def _merge_scraped(existing, config, slug, links):
         if link_rec_id in seen_ids:
             continue
         seen_ids.add(link_rec_id)
-        start_date = link.get("start_date", "")
-        session_key = (
-            str(link.get("meeting_id", "") or ""),
-            str(start_date or ""),
-        )
-        has_session = bool(session_key[0] and session_key[1])
+        start_date = str(link.get("start_date", "") or "")
+        # La fecha identifica la sesión dentro del curso (los tokens rotan).
+        session_key = start_date
+        has_session = bool(session_key)
         if has_session:
             if session_key in seen_sessions:
                 continue
@@ -304,9 +299,14 @@ def _merge_scraped(existing, config, slug, links):
             rec_info = course_data["recordings"][rec_id]
             rec_info["url"] = link["full_url"]
             rec_info["share_url"] = link["url"]
-            rec_info["title"] = link.get("topic") or link["text"] or rec_info.get("title", "")
-            rec_info["meeting_id"] = link.get("meeting_id") or rec_info.get("meeting_id", "")
-            rec_info["start_date"] = start_date or rec_info.get("start_date", "")
+            # No sobrescribir la identidad de una sesión conocida: un token rotado
+            # puede reapuntar a otra fecha y provocar colisiones que pierden clases.
+            if not rec_info.get("title"):
+                rec_info["title"] = link.get("topic") or link["text"] or ""
+            if not rec_info.get("meeting_id"):
+                rec_info["meeting_id"] = link.get("meeting_id") or ""
+            if not rec_info.get("start_date"):
+                rec_info["start_date"] = start_date or ""
             duration = link.get("duration_minutes")
             if duration or not rec_info.get("duration_minutes"):
                 rec_info["duration_minutes"] = duration or 0
@@ -362,13 +362,12 @@ def _collapse_duplicate_sessions(course_data: dict) -> None:
     recordings = course_data.get("recordings", {})
     by_session = {}
     for rec_id, rec_info in recordings.items():
-        key = (
-            str(rec_info.get("meeting_id", "") or ""),
-            str(rec_info.get("start_date", "") or ""),
-        )
-        if not key[0] or not key[1]:
+        start_date = str(rec_info.get("start_date", "") or "")
+        if not start_date:
             continue
-        by_session.setdefault(key, []).append(rec_id)
+        # Dentro de un mismo curso, el start_date exacto identifica la sesión: los
+        # tokens de Zoom rotan y el meeting_id puede ser inconsistente (Ingenia).
+        by_session.setdefault(start_date, []).append(rec_id)
 
     for key, rec_ids in by_session.items():
         if len(rec_ids) < 2:

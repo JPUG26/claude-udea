@@ -596,18 +596,46 @@ class RecordingMergeTests(unittest.TestCase):
             {
                 "url": f"https://zoom.example/rec/share/{rec_id}",
                 "full_url": f"https://zoom.example/rec/share/{rec_id}",
-                "text": title,
-                "topic": title,
-                "start_date": "2026-09-01T10:00:00Z",
+                "text": "Architecture",
+                "topic": "Architecture",
+                "meeting_id": meeting_id,
+                "start_date": start_date,
                 "duration_minutes": 60,
             }
-            for rec_id, title in (("rec-1", "Architecture"), ("rec-2", "Architecture"))
+            for rec_id, meeting_id, start_date in (
+                ("rec-1", "room-a", "2026-09-01T10:00:00Z"),
+                ("rec-2", "room-b", "2026-09-01T15:00:00Z"),
+            )
         ]
 
         pending = _merge_scraped(existing, config, "architecture", links)
 
         self.assertEqual(set(existing["architecture"]["recordings"]), {"rec-1", "rec-2"})
         self.assertEqual({item[1] for item in pending}, {"rec-1", "rec-2"})
+
+    def test_same_date_without_meeting_id_collapses_to_one_session(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {}
+        config = {
+            "download_dir": ".",
+            "courses": {"architecture": {"name": "Architecture"}},
+        }
+        links = [
+            {
+                "url": f"https://zoom.example/rec/share/{rec_id}",
+                "full_url": f"https://zoom.example/rec/share/{rec_id}",
+                "text": "Architecture",
+                "topic": "Architecture",
+                "start_date": "2026-09-01T10:00:00Z",
+                "duration_minutes": 60,
+            }
+            for rec_id in ("rec-1", "rec-2")
+        ]
+
+        _merge_scraped(existing, config, "architecture", links)
+
+        self.assertEqual(len(existing["architecture"]["recordings"]), 1)
 
     def test_duplicate_id_in_one_scrape_is_queued_once(self):
         from claude_udea.cli import _merge_scraped
@@ -729,13 +757,13 @@ class SessionDedupTests(unittest.TestCase):
         self.assertEqual(len(recordings), 1)
         self.assertEqual({item[1] for item in pending}, set(recordings))
 
-    def test_same_date_different_meeting_keeps_both(self):
+    def test_different_sessions_same_day_keep_both(self):
         from claude_udea.cli import _merge_scraped
 
         existing = {}
         links = [
             self._link("rec-1", "97100466870", "2026-09-16T11:06:05Z"),
-            self._link("rec-2", "99021321325", "2026-09-16T11:06:05Z"),
+            self._link("rec-2", "99021321325", "2026-09-16T18:06:05Z"),
         ]
 
         _merge_scraped(existing, self._config(), "architecture", links)
