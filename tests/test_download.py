@@ -7,9 +7,11 @@ from unittest.mock import Mock, patch
 
 from claude_udea.download import (
     _build_rec_id_map,
+    _class_category_for,
     _class_filename,
     _download_chat,
     _filename_suffix,
+    _recording_alias_ids,
     _recording_category,
     copy_transcripts,
     rename_downloads,
@@ -685,9 +687,244 @@ if __name__ == "__main__":
     unittest.main()
 
 
-if __name__ == "__main__":
-    unittest.main()
+class MeetingIdClassificationTests(unittest.TestCase):
+    FABRICA_IDS = {"99021321325"}
+
+    def test_fabrica_title_on_architecture_meeting_is_course(self):
+        rec_info = {
+            "title": "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA (2026-2)",
+            "meeting_id": "97100466870",
+        }
+        self.assertEqual(_class_category_for(rec_info, self.FABRICA_IDS), "course")
+
+    def test_architecture_title_on_fabrica_meeting_is_fabrica(self):
+        rec_info = {
+            "title": "2554585-2 ARQUITECTURA DE SOFTWAR",
+            "meeting_id": "99021321325",
+        }
+        self.assertEqual(_class_category_for(rec_info, self.FABRICA_IDS), "fabrica_escuela")
+
+    def test_title_fallback_without_meeting_id(self):
+        rec_info = {"title": "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA (2026-2)"}
+        self.assertEqual(_class_category_for(rec_info, self.FABRICA_IDS), "fabrica_escuela")
+
+    def test_title_fallback_without_configured_ids(self):
+        rec_info = {
+            "title": "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA (2026-2)",
+            "meeting_id": "99021321325",
+        }
+        self.assertEqual(_class_category_for(rec_info, None), "fabrica_escuela")
+
+    def test_august_videos_of_architecture_meeting_number_as_course(self):
+        recordings = {
+            "arquitectura-de-software": {
+                "name": "Arquitectura de Software",
+                "recordings": {
+                    "aug-971": {
+                        "title": "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA (2026-2)",
+                        "meeting_id": "97100466870",
+                        "start_date": "2026-08-12T11:00:00Z",
+                    },
+                    "aug-990": {
+                        "title": "FABRICA DE ESCUELA INGENIERÍA DE SISTEMA (2026-2)",
+                        "meeting_id": "99021321325",
+                        "start_date": "2026-08-12T11:00:00Z",
+                    },
+                    "sep-971": {
+                        "title": "2554585-2 ARQUITECTURA DE SOFTWAR",
+                        "meeting_id": "97100466870",
+                        "start_date": "2026-09-10T17:00:00Z",
+                    },
+                },
+            },
+        }
+        options = {
+            "arquitectura-de-software": {"fabrica_meeting_ids": ["99021321325"]},
+        }
+        id_map = _build_rec_id_map(recordings, options)
+
+        self.assertEqual(id_map["aug-971"]["class_category"], "course")
+        self.assertEqual(id_map["aug-971"]["class_number"], 1)
+        self.assertEqual(id_map["sep-971"]["class_number"], 2)
+        self.assertEqual(id_map["aug-990"]["class_category"], "fabrica_escuela")
+        self.assertEqual(id_map["aug-990"]["class_number"], 1)
+
+
+class SessionDedupTests(unittest.TestCase):
+    def _config(self):
+        return {
+            "download_dir": ".",
+            "courses": {"architecture": {"name": "Architecture"}},
+        }
+
+    @staticmethod
+    def _link(rec_id, meeting_id, start_date):
+        return {
+            "url": f"https://zoom.example/rec/share/{rec_id}",
+            "full_url": f"https://zoom.example/rec/share/{rec_id}",
+            "text": "Architecture",
+            "topic": "Architecture",
+            "meeting_id": meeting_id,
+            "start_date": start_date,
+            "duration_minutes": 60,
+        }
+
+    def test_same_meeting_and_date_collapse_into_one_recording(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {}
+        links = [
+            self._link("rec-1", "97100466870", "2026-08-19T11:49:43Z"),
+            self._link("rec-2", "97100466870", "2026-08-19T11:49:43Z"),
+        ]
+
+        pending = _merge_scraped(existing, self._config(), "architecture", links)
+
+        recordings = existing["architecture"]["recordings"]
+        self.assertEqual(len(recordings), 1)
+        self.assertEqual({item[1] for item in pending}, set(recordings))
+
+    def test_same_date_different_meeting_keeps_both(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {}
+        links = [
+            self._link("rec-1", "97100466870", "2026-09-16T11:06:05Z"),
+            self._link("rec-2", "99021321325", "2026-09-16T11:06:05Z"),
+        ]
+
+        _merge_scraped(existing, self._config(), "architecture", links)
+
+        self.assertEqual(len(existing["architecture"]["recordings"]), 2)
+
+    def test_new_link_matching_existing_session_updates_it(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {}
+        first = [self._link("rec-1", "97100466870", "2026-08-19T11:49:43Z")]
+        _merge_scraped(existing, self._config(), "architecture", first)
+
+        # La misma sesión descubierta después con otra URL y mejor duración.
+        second = [self._link("rec-9", "97100466870", "2026-08-19T11:49:43Z")]
+        second[0]["duration_minutes"] = 72
+        _merge_scraped(existing, self._config(), "architecture", second)
+
+        recordings = existing["architecture"]["recordings"]
+        self.assertEqual(set(recordings), {"rec-1"})
+        self.assertEqual(recordings["rec-1"]["duration_minutes"], 72)
+
+    def test_persisted_duplicates_are_collapsed_before_merge(self):
+        from claude_udea.cli import _merge_scraped
+
+        existing = {
+            "architecture": {
+                "name": "Architecture",
+                "recordings": {
+                    "rec-1": {
+                        "url": "https://zoom.example/rec/share/rec-1",
+                        "meeting_id": "97100466870",
+                        "start_date": "2026-08-19T11:49:43Z",
+                        "duration_minutes": 0,
+                        "downloaded": True,
+                        "organized_files": ["videos/Clase #1.mp4"],
+                    },
+                    "rec-2": {
+                        "url": "https://zoom.example/rec/share/rec-2",
+                        "meeting_id": "97100466870",
+                        "start_date": "2026-08-19T11:49:43Z",
+                        "duration_minutes": 72,
+                        "downloaded": False,
+                        "organized_files": ["transcripts/zoom/Clase #1.cc.vtt"],
+                    },
+                },
+            },
+        }
+
+        _merge_scraped(existing, self._config(), "architecture", [])
+
+        recordings = existing["architecture"]["recordings"]
+        self.assertEqual(set(recordings), {"rec-1"})
+        keeper = recordings["rec-1"]
+        self.assertTrue(keeper["downloaded"])
+        self.assertEqual(keeper["duration_minutes"], 72)
+        self.assertIn("videos/Clase #1.mp4", keeper["organized_files"])
+        self.assertIn("transcripts/zoom/Clase #1.cc.vtt", keeper["organized_files"])
+
+
+class VideoArtifactBackupTests(unittest.TestCase):
+    def _rec_info(self, organized_files):
+        return {
+            "title": "2554585-2 ARQUITECTURA DE SOFTWAR",
+            "meeting_id": "97100466870",
+            "start_date": "2026-08-12T11:03:50Z",
+            "organized_files": organized_files,
+        }
+
+    def test_backup_copy_does_not_count_as_video_present(self):
+        from claude_udea.cli import _has_video_artifact, _recording_video_missing
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "arquitectura-de-software"
+            backup = course_dir / ".claude-udea-backup" / "identical-videos"
+            backup.mkdir(parents=True)
+            name = "Clase #1 - 2026-08-12.mp4"
+            (backup / name).write_bytes(b"video")
+            rec_info = self._rec_info([f".claude-udea-backup/identical-videos/{name}"])
+
+            self.assertFalse(_has_video_artifact(course_dir, rec_info, "rec-1"))
+            self.assertTrue(_recording_video_missing(course_dir, rec_info, "rec-1"))
+
+    def test_organized_video_counts_as_present(self):
+        from claude_udea.cli import _has_video_artifact
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "arquitectura-de-software"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            name = "Clase #1 - 2026-08-12.mp4"
+            (videos / name).write_bytes(b"video")
+            rec_info = self._rec_info([f"videos/{name}"])
+
+            self.assertTrue(_has_video_artifact(course_dir, rec_info, "rec-1"))
+
+
+class RecordingAliasTests(unittest.TestCase):
+    def test_alias_ids_include_key_and_url_token(self):
+        rec_info = {
+            "url": "https://zoom.example/rec/share/TOKEN123.ABC",
+            "share_url": "https://zoom.example/rec/share/TOKEN123.ABC",
+        }
+        self.assertEqual(
+            _recording_alias_ids("KEY1", rec_info), ["KEY1", "TOKEN123.ABC"]
+        )
+
+    def test_rename_downloads_matches_raw_file_by_url_token(self):
+        recordings = {
+            "arquitectura-de-software": {
+                "recordings": {
+                    "KEY1": {
+                        "title": "2554585-2 ARQUITECTURA DE SOFTWAR",
+                        "meeting_id": "97100466870",
+                        "start_date": "2026-08-12T11:03:50Z",
+                        "url": "https://zoom.example/rec/share/TOKEN123.ABC",
+                        "share_url": "https://zoom.example/rec/share/TOKEN123.ABC",
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            download_dir = Path(temporary_directory)
+            course_dir = download_dir / "arquitectura-de-software"
+            course_dir.mkdir(parents=True)
+            raw = course_dir / "2554585-2 ARQUITECTURA DE SOFTWAR [TOKEN123.ABC].mp4"
+            raw.write_bytes(b"video")
+
+            rename_downloads(download_dir, recordings)
+
+            self.assertFalse(raw.exists())
+            self.assertTrue((course_dir / "videos" / "Clase #1 - 2026-08-12.mp4").is_file())
 
 
 if __name__ == "__main__":
     unittest.main()
+

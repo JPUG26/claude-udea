@@ -158,6 +158,20 @@ def _extract_rec_id_from_filename(filename: str) -> str:
     return match.group(1) if match else ""
 
 
+def _recording_alias_ids(rec_id: str, rec_info: dict) -> list[str]:
+    """IDs con los que puede aparecer un archivo de esta grabación.
+
+    La clave del registro puede diferir del token de la URL porque los tokens de
+    Zoom rotan entre ejecuciones; se aceptan la clave y el token de la URL.
+    """
+    ids = [rec_id]
+    for key in ("url", "share_url"):
+        token = _extract_rec_id_from_url(rec_info.get(key) or "")
+        if token and token not in ids:
+            ids.append(token)
+    return ids
+
+
 def _parse_recording_datetime(value):
     """Interpreta fechas ISO y formatos habituales de Moodle en español."""
     if not value:
@@ -311,17 +325,36 @@ def _recording_category(filename: str, suffix: str, source: Path | None = None) 
     return ""
 
 
-def _build_rec_id_map(recordings: dict) -> dict:
+def _class_category_for(rec_info: dict, fabrica_meeting_ids: set | None = None) -> str:
+    """Clasifica una grabación: el meeting_id es la señal primaria; el título es fallback.
+
+    El título del meeting de Zoom no es confiable (la sala puede renombrarse a mitad
+    de semestre y ambas salas registran la misma sesión), así que cuando el curso
+    configura `fabrica_meeting_ids`, el meeting_id decide la categoría.
+    """
+    meeting_id = str(rec_info.get("meeting_id", "") or "")
+    if meeting_id and fabrica_meeting_ids:
+        return "fabrica_escuela" if meeting_id in fabrica_meeting_ids else "course"
+    return _class_category(rec_info.get("title", ""))
+
+
+def _course_fabrica_ids(course_options: dict | None, slug: str) -> set:
+    options = (course_options or {}).get(slug) or {}
+    return {str(value) for value in options.get("fabrica_meeting_ids", []) or []}
+
+
+def _build_rec_id_map(recordings: dict, course_options: dict | None = None) -> dict:
     """Mapa de rec_id -> {slug, course_name, start_date, duration, title}."""
     id_map = {}
     for slug, course in recordings.items():
+        fabrica_meeting_ids = _course_fabrica_ids(course_options, slug)
         ordered_recordings = sorted(
             course.get("recordings", {}).items(), key=_recording_sort_key
         )
         class_numbers = {}
         class_by_datetime = {}
         for rec_id, rec_info in ordered_recordings:
-            category = _class_category(rec_info.get("title", ""))
+            category = _class_category_for(rec_info, fabrica_meeting_ids)
             date_key = _datetime_key(rec_info.get("start_date", ""))
             category_date_key = (category, date_key)
             if date_key is not None and category_date_key in class_by_datetime:
@@ -365,7 +398,7 @@ def _inject_vtt_metadata(vtt_content: str, course_name: str, date_str: str,
     return note_block + "\n" + vtt_content
 
 
-def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
+def copy_transcripts(download_dir: Path, recordings: dict = None, course_options: dict | None = None) -> int:
     """
     Copia VTTs a carpeta centralizada con fecha en el nombre,
     metadata inyectada en el VTT y genera index.json.
@@ -382,7 +415,7 @@ def copy_transcripts(download_dir: Path, recordings: dict = None) -> int:
         else:
             recordings = {}
 
-    id_map = _build_rec_id_map(recordings)
+    id_map = _build_rec_id_map(recordings, course_options)
     class_map = {
         (meta["slug"], meta["class_category"], meta["class_number"]): meta
         for meta in id_map.values()
@@ -517,10 +550,10 @@ def _restore_stale_organization_temps(download_dir: Path) -> None:
             temporary.unlink()
 
 
-def rename_downloads(download_dir: Path, recordings: dict) -> int:
+def rename_downloads(download_dir: Path, recordings: dict, course_options: dict | None = None) -> int:
     """Renombra descargas por clase y guarda sus rutas para futuras renumeraciones."""
     _restore_stale_organization_temps(download_dir)
-    id_map = _build_rec_id_map(recordings)
+    id_map = _build_rec_id_map(recordings, course_options)
     renamed_count = 0
 
     for slug, course in recordings.items():
@@ -567,10 +600,11 @@ def rename_downloads(download_dir: Path, recordings: dict) -> int:
             if whisper_transcript.is_file() and whisper_transcript not in organized_paths:
                 sources[whisper_transcript] = ".whisper.transcript.vtt"
 
+            alias_ids = _recording_alias_ids(rec_id, rec_info)
             for source in course_dir.rglob("*"):
                 if not source.is_file() or source in sources or ".claude-udea-backup" in source.parts:
                     continue
-                if f"[{rec_id}" in source.name:
+                if any(f"[{alias}" in source.name for alias in alias_ids):
                     sources[source] = _filename_suffix(source.name, rec_id)
 
             if not sources and not already_organized:
