@@ -5,7 +5,14 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock, patch
 
-from transcribe_missing import WhisperSettings, _whisper_destination, find_missing, transcribe_all
+from transcribe_missing import (
+    WhisperSettings,
+    _recording_transcripts,
+    _whisper_destination,
+    find_missing,
+    settings_from_args,
+    transcribe_all,
+)
 from claude_udea.download import copy_transcripts, rename_downloads
 
 
@@ -79,6 +86,150 @@ class WhisperTranscriptionTests(unittest.TestCase):
             self.assertEqual(len(list(course_dir.glob("*.mp4"))), 3)
             self.assertEqual(transcribe_all(work_dir), (0, 0))
             self.assertEqual(find_missing(work_dir)[1], [])
+
+    def test_legacy_small_txt_does_not_block_medium_transcript_and_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            course_dir, recordings = self.slot_fixture(work_dir, parts=(None,))
+            legacy_dir = course_dir / "transcripts" / "whisper" / "whisper con bajo"
+            legacy_dir.mkdir(parents=True)
+            legacy = legacy_dir / "Clase #1 - 2026-09-01.whisper.transcript.txt"
+            legacy.write_text(
+                "WEBVTT\n\nNOTE\nTranscripción generada localmente con faster-whisper (small, int8)\n\n"
+                "1\n00:00:00.000 --> 00:00:01.000\nsmall\n",
+                encoding="utf-8",
+            )
+            recordings["architecture"]["recordings"]["rec-1"]["organized_files"].append(
+                "transcripts/whisper/whisper con bajo/" + legacy.name
+            )
+            (work_dir / "recordings.json").write_text(json.dumps(recordings), encoding="utf-8")
+
+            self.assertEqual(len(_recording_transcripts(
+                course_dir, "rec-1", recordings["architecture"]["recordings"]["rec-1"],
+            )), 0)
+            self.assertEqual(find_missing(work_dir)[1][0]["rec_id"], "rec-1")
+            result, _, _ = self.run_slots(work_dir)
+            self.assertEqual(result, (1, 0))
+            self.assertTrue(legacy.exists())
+            active = course_dir / "transcripts" / "whisper" / "Clase #1 - 2026-09-01.whisper.transcript.vtt"
+            self.assertTrue(active.is_file())
+
+    def test_legacy_whisper_txt_is_not_deleted_when_zoom_is_not_kept(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            course_dir, recordings = self.slot_fixture(work_dir, parts=(None,))
+            legacy_dir = course_dir / "transcripts" / "whisper" / "whisper con bajo"
+            legacy_dir.mkdir(parents=True)
+            legacy = legacy_dir / "Clase #1 - 2026-09-01.whisper.transcript.txt"
+            legacy.write_text("WEBVTT\nsmall\n", encoding="utf-8")
+            info = recordings["architecture"]["recordings"]["rec-1"]
+            info["organized_files"].append("transcripts/whisper/whisper con bajo/" + legacy.name)
+            (work_dir / "recordings.json").write_text(json.dumps(recordings), encoding="utf-8")
+
+            result, _, _ = self.run_slots(work_dir, keep_zoom_transcripts=False)
+
+            self.assertEqual(result, (1, 0))
+            self.assertTrue(legacy.exists())
+
+    def test_settings_flags_accept_equals_and_reject_invalid_chunk_size(self):
+        settings = settings_from_args([
+            "--whisper-model=medium", "--whisper-beam-size", "2",
+            "--whisper-chunk-seconds=600", "--whisper-no-conditioning",
+        ])
+        self.assertEqual((settings.model, settings.beam_size, settings.chunk_seconds), ("medium", 2, 600))
+        self.assertFalse(settings.condition_on_previous_text)
+        with self.assertRaises(ValueError):
+            settings_from_args(["--whisper-chunk-seconds", "0"])
+
+    def test_chunk_cache_is_invalidated_when_settings_or_chunk_count_changes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            wav = root / "audio.wav"
+            wav.write_bytes(b"audio")
+            parts = root / "parts"
+            settings = WhisperSettings(chunk_seconds=1)
+            with (
+                patch("transcribe_missing.wav_duration", return_value=2.5),
+                patch("transcribe_missing.extract_chunk_audio", side_effect=lambda _wav, chunk, _offset, _length: chunk.write_bytes(b"chunk")),
+            ):
+                model = Mock()
+                model.transcribe.side_effect = lambda *_args, **_kwargs: (
+                    iter([Mock(start=0, end=0.5, text="hello")]), None,
+                )
+                from transcribe_missing import transcribe
+
+                transcribe(model, wav, root / "first.vtt", parts, settings)
+                self.assertEqual(len(list(parts.glob("part*.json"))), 3)
+                transcribe(model, wav, root / "second.vtt", parts, WhisperSettings(chunk_seconds=2))
+                self.assertEqual(len(list(parts.glob("part*.json"))), 2)
+                self.assertEqual(model.transcribe.call_count, 5)
+
+    def test_chunk_cache_without_manifest_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            wav = root / "audio.wav"
+            wav.write_bytes(b"audio")
+            parts = root / "parts"
+            parts.mkdir()
+            (parts / "part000.json").write_text("[]", encoding="utf-8")
+            model = Mock()
+            model.transcribe.return_value = (iter([Mock(start=0, end=0.5, text="hello")]), None)
+            from transcribe_missing import transcribe
+            with (
+                patch("transcribe_missing.wav_duration", return_value=1.0),
+                patch("transcribe_missing.extract_chunk_audio", side_effect=lambda _wav, chunk, _offset, _length: chunk.write_bytes(b"chunk")),
+            ):
+                transcribe(model, wav, root / "output.vtt", parts, WhisperSettings(chunk_seconds=5))
+            model.transcribe.assert_called_once()
+
+    def test_cli_whisper_values_are_not_treated_as_course_slugs(self):
+        from claude_udea.cli import _filter_course_args
+
+        remaining = _filter_course_args([
+            "modelos-y-simulacion-de-sistemas-ii", "--whisper-model", "medium",
+            "--whisper-beam-size=1", "--class", "9", "--class", "10",
+        ])
+        self.assertEqual(remaining, ["modelos-y-simulacion-de-sistemas-ii"])
+
+    def test_cli_flags_can_explicitly_keep_zoom_transcripts_noninteractively(self):
+        from transcribe_missing import main
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            self.slot_fixture(work_dir, parts=(None,))
+            zoom = work_dir / "downloads" / "architecture" / "Clase #1 - 2026-09-01.cc.vtt"
+            zoom.write_text("WEBVTT\n", encoding="utf-8")
+            with (
+                patch("sys.argv", ["transcribe_missing.py", "--work-dir", str(work_dir), "--always-whisper", "--keep-zoom-transcripts", "--check"]),
+                patch("builtins.input") as prompt,
+                patch("transcribe_missing.log"),
+                patch("transcribe_missing.transcribe_all", return_value=(0, 0)),
+                self.assertRaises(SystemExit) as exit_result,
+            ):
+                main()
+            self.assertEqual(exit_result.exception.code, 0)
+            prompt.assert_not_called()
+
+    def test_no_speech_marker_skips_slot_without_creating_empty_vtt(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            work_dir = Path(temporary_directory)
+            course_dir, _ = self.slot_fixture(work_dir, parts=(None,))
+            from transcribe_missing import _no_speech_marker, _build_rec_id_map
+            recordings = json.loads((work_dir / "recordings.json").read_text(encoding="utf-8"))
+            meta = _build_rec_id_map(recordings)["rec-1"]
+            marker = _no_speech_marker(course_dir, meta, course_dir / "Clase #1 - 2026-09-01.mp4")
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            video = course_dir / "Clase #1 - 2026-09-01.mp4"
+            marker.write_text(json.dumps({
+                "status": "no-speech",
+                "model": "medium",
+                "compute_type": "int8",
+                "source": [str(video.resolve()), video.stat().st_size, video.stat().st_mtime_ns],
+            }), encoding="utf-8")
+            result, _, _ = self.run_slots(work_dir)
+            self.assertEqual(result, (0, 0))
+            self.assertTrue(marker.exists())
+            self.assertFalse((course_dir / "transcripts" / "whisper" / "Clase #1 - 2026-09-01.whisper.transcript.vtt").exists())
 
     def test_completed_part_does_not_skip_other_slots_or_get_deleted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

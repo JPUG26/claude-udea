@@ -887,7 +887,7 @@ def fase_final(config, recordings, target_courses, assistant_override=None, olla
         n = count_transcripts(download_dir, slug)
         total_vtts += n
 
-    print(f"  ✔ {total_vtts} transcripciones listas\n")
+    print(f"  ✔ {total_vtts} archivos VTT listos (incluye subtítulos y capítulos)\n")
 
     if total_vtts == 0:
         return
@@ -1016,6 +1016,25 @@ def _sync_ingenia_materials(work_dir: Path, course_url: str):
 
 # ─── Main ────────────────────────────────────────────────────
 
+def _filter_course_args(args: list[str]) -> list[str]:
+    value_flags = {
+        "--whisper-model", "--whisper-compute-type", "--whisper-device",
+        "--whisper-cpu-threads", "--whisper-beam-size", "--whisper-language",
+        "--whisper-initial-prompt", "--whisper-chunk-seconds", "--class",
+        "--keep-zoom-transcripts", "--discard-zoom-transcripts",
+    }
+    result = []
+    index = 0
+    while index < len(args):
+        flag, separator, _value = args[index].partition("=")
+        if flag in value_flags:
+            index += 1 if separator else 2
+            continue
+        result.append(args[index])
+        index += 1
+    return result
+
+
 def main():
     from claude_udea.ollama_chat import parse_ollama_model_flag
     args, ollama_model = parse_ollama_model_flag(sys.argv[1:])
@@ -1121,7 +1140,7 @@ def main():
         _generate_assistant_md(work_dir)
         return
 
-    course_args = [a for a in args if not a.startswith("--")]
+    course_args = [a for a in _filter_course_args(args) if not a.startswith("--")]
     all_courses = list(config["courses"].keys())
 
     for slug in course_args:
@@ -1192,16 +1211,17 @@ def main():
     )
 
     if always_whisper and not dry_run:
-        from transcribe_missing import has_zoom_transcripts, settings_from_args, transcribe_all
         try:
-            keep_zoom_transcripts = False
-            if has_zoom_transcripts(work_dir, target_courses):
-                keep_zoom_transcripts = questionary.confirm(
-                    "Hay transcripciones de Zoom. ¿Conservarlas además de las de faster-whisper?",
-                    default=True,
-                ).ask()
-                if keep_zoom_transcripts is None:
-                    sys.exit(0)
+            from transcribe_missing import has_zoom_transcripts, settings_from_args, transcribe_all
+            keep_zoom_transcripts = "--discard-zoom-transcripts" not in args
+            if "--keep-zoom-transcripts" not in args and "--discard-zoom-transcripts" not in args:
+                if has_zoom_transcripts(work_dir, target_courses):
+                    keep_zoom_transcripts = questionary.confirm(
+                        "Hay transcripciones de Zoom. ¿Conservarlas además de las de faster-whisper?",
+                        default=True,
+                    ).ask()
+                    if keep_zoom_transcripts is None:
+                        sys.exit(0)
             class_numbers = []
             for index, token in enumerate(args):
                 if token == "--class" and index + 1 < len(args):
@@ -1218,8 +1238,25 @@ def main():
             )
             failed += whisper_failed
             print(f"  faster-whisper: {whisper_ok} completadas, {whisper_failed} fallidas.\n")
+            if whisper_ok:
+                fase_final(
+                    config,
+                    recordings,
+                    target_courses,
+                    assistant_override="none",
+                )
+                if skip_materials:
+                    print("  Materiales omitidos por --skip-materials.\n")
+                return
         except (OSError, RuntimeError, ValueError) as error:
             print(f"  ⚠ No se pudo iniciar faster-whisper: {error}\n")
+            failed += 1
+        except ImportError as error:
+            print(
+                "  ⚠ No se pudo importar el módulo de transcripción. "
+                "Reinstala claude-udea en el mismo entorno de Python del comando: "
+                f"{error}\n"
+            )
             failed += 1
 
     if not dry_run and not skip_materials:

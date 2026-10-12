@@ -1034,6 +1034,24 @@ class RepairCourseTests(unittest.TestCase):
             self.assertTrue(source.exists())
             self.assertNotIn("empty_recording", rec)
 
+    @patch("claude_udea.download._ffprobe_available", return_value=True)
+    @patch("claude_udea.download._probe_video", return_value=(None, None))
+    def test_small_video_with_unknown_probe_and_zero_rounded_minutes_is_preserved(self, _probe, _available):
+        recordings = self._recordings("2026-08-28")
+        rec = recordings["architecture"]["recordings"]["rec-1"]
+        rec["duration_minutes"] = 0
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            course_dir = Path(temporary_directory) / "architecture"
+            videos = course_dir / "videos"
+            videos.mkdir(parents=True)
+            source = videos / "Clase #1 - 2026-08-28.mp4"
+            source.write_bytes(b"short media")
+
+            repair_course(course_dir, recordings["architecture"], _build_rec_id_map(recordings))
+
+            self.assertTrue(source.exists())
+            self.assertNotIn("empty_recording", rec)
+
     @staticmethod
     def _recordings(*dates):
         return {
@@ -1071,7 +1089,9 @@ class RepairCourseTests(unittest.TestCase):
             self.assertTrue(video.exists())
             self.assertTrue(caption.exists())
 
-    def test_applies_empty_video_backup_and_marks_recording(self):
+    @patch("claude_udea.download._ffprobe_available", return_value=True)
+    @patch("claude_udea.download._probe_video", return_value=(0, None))
+    def test_applies_empty_video_backup_and_marks_recording(self, _probe, _available):
         recordings = self._recordings("2026-09-01")
         rec_info = recordings["architecture"]["recordings"]["rec-1"]
         with tempfile.TemporaryDirectory() as temporary_directory:

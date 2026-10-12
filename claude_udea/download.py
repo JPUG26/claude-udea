@@ -586,11 +586,17 @@ def copy_transcripts(download_dir: Path, recordings: dict = None, course_options
                 continue
             process_vtt(vtt_file, slug)
 
-    # Ordenar por fecha
+    # Sort same-day entries by class and part instead of lexical filename order.
     for slug in index:
         if selected is not None and slug not in selected:
             continue
-        index[slug]["files"].sort(key=lambda x: x["date"])
+        index[slug]["files"].sort(key=lambda x: (
+            x["date"],
+            0 if x.get("class_number") is not None else 1,
+            x.get("class_number") if x.get("class_number") is not None else 0,
+            x.get("part") or 0,
+            x["file"].casefold(),
+        ))
 
     # Escribir index.json
     if index or selected is not None:
@@ -1450,7 +1456,8 @@ def repair_course(course_dir: Path, course: dict, id_map: dict, dry_run: bool = 
         # A short but valid clip is not an empty recording. Without probe data,
         # only classify tiny media when the recording has no positive duration.
         empty = duration == 0 or (
-            duration is None and asset.size < _EMPTY_VIDEO_BYTES
+            duration is None and not has_ffprobe
+            and asset.size < _EMPTY_VIDEO_BYTES
             and not recordings.get(asset.rec_id, {}).get("duration_minutes")
         )
         if not empty:
