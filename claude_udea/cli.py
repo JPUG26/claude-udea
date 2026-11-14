@@ -1103,11 +1103,7 @@ def main():
 
     dry_run = "--dry-run" in args
     if repair_only:
-        course_args = [
-            arg for index, arg in enumerate(args)
-            if not arg.startswith("--")
-            and (index == 0 or args[index - 1] not in {"--whisper-model", "--whisper-compute-type", "--whisper-device", "--whisper-cpu-threads", "--whisper-beam-size", "--whisper-language", "--whisper-initial-prompt", "--whisper-chunk-seconds"})
-        ]
+        course_args = [a for a in _filter_course_args(args) if not a.startswith("--")]
         all_courses = list(config["courses"].keys())
         unknown = [slug for slug in course_args if slug not in config["courses"]]
         if unknown:
@@ -1177,7 +1173,8 @@ def main():
 
     # Menú
     skip_video = skip_video_flag
-    if not skip_video_flag and not download_all_flag and not dry_run:
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if not skip_video_flag and not download_all_flag and not dry_run and interactive:
         choice = questionary.select(
             "¿Qué deseas descargar?",
             choices=[
@@ -1216,12 +1213,16 @@ def main():
             keep_zoom_transcripts = "--discard-zoom-transcripts" not in args
             if "--keep-zoom-transcripts" not in args and "--discard-zoom-transcripts" not in args:
                 if has_zoom_transcripts(work_dir, target_courses):
-                    keep_zoom_transcripts = questionary.confirm(
-                        "Hay transcripciones de Zoom. ¿Conservarlas además de las de faster-whisper?",
-                        default=True,
-                    ).ask()
-                    if keep_zoom_transcripts is None:
-                        sys.exit(0)
+                    if sys.stdin.isatty() and sys.stdout.isatty():
+                        keep_zoom_transcripts = questionary.confirm(
+                            "Hay transcripciones de Zoom. ¿Conservarlas además de las de faster-whisper?",
+                            default=True,
+                        ).ask()
+                        if keep_zoom_transcripts is None:
+                            sys.exit(0)
+                    else:
+                        print("  Sin consola interactiva: se conservan las transcripciones de Zoom "
+                              "(usa --discard-zoom-transcripts para descartarlas).\n")
             class_numbers = []
             for index, token in enumerate(args):
                 if token == "--class" and index + 1 < len(args):

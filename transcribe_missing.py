@@ -519,12 +519,9 @@ def _has_no_speech_marker(course_dir: Path, meta: dict, video: Path | None,
         [str(video.resolve()), video.stat().st_size, video.stat().st_mtime_ns]
         if video is not None else None
     )
-    expected_source = source_identity
+    source_matches = result.get("source") == source_identity
     if video is None:
-        expected_source = result.get("source")
-    source_matches = result.get("source") == expected_source
-    if video is not None and isinstance(result.get("source"), str):
-        source_matches = Path(result["source"]).resolve() == video.resolve()
+        source_matches = True
     return (
         result.get("status") == "no-speech"
         and result.get("model") == settings.model

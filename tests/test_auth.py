@@ -152,8 +152,14 @@ class MoodleDateWindowTests(unittest.TestCase):
 
         responses = {
             initial_url: record_page("rec-0"),
-            auth._append_params(initial_url, {"from": "2026-08-01", "to": "2026-08-30"}): record_page("rec-1"),
-            auth._append_params(initial_url, {"from": "2026-08-31", "to": "2026-09-29"}): record_page("rec-2"),
+            auth._append_params(initial_url, {
+                "from[day]": "1", "from[month]": "8", "from[year]": "2026",
+                "to[day]": "30", "to[month]": "8", "to[year]": "2026",
+            }): record_page("rec-1"),
+            auth._append_params(initial_url, {
+                "from[day]": "31", "from[month]": "8", "from[year]": "2026",
+                "to[day]": "29", "to[month]": "9", "to[year]": "2026",
+            }): record_page("rec-2"),
         }
         session = Mock()
         session.get.side_effect = lambda url, **kwargs: SimpleNamespace(
@@ -171,6 +177,16 @@ class MoodleDateWindowTests(unittest.TestCase):
 
         self.assertEqual(slug, "architecture")
         self.assertEqual([link["id"] for link in links], ["rec-1", "rec-2"])
+
+    def test_moodle_date_params_use_day_month_year_fields(self):
+        self.assertEqual(
+            auth._moodle_date_params("from[day]", "2026-08-01"),
+            {"from[day]": "1", "from[month]": "8", "from[year]": "2026"},
+        )
+        self.assertEqual(
+            auth._moodle_date_params("to", "2026-11-12"),
+            {"to[day]": "12", "to[month]": "11", "to[year]": "2026"},
+        )
 
 
 if __name__ == "__main__":

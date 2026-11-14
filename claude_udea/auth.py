@@ -384,6 +384,17 @@ def _date_windows() -> list[tuple[str, str]]:
     return windows
 
 
+def _moodle_date_params(field: str, iso_date: str) -> dict[str, str]:
+    """Convierte una fecha ISO a los tres campos day/month/year que usa el selector de Moodle."""
+    value = date.fromisoformat(iso_date)
+    base = field.split("[", 1)[0]
+    return {
+        f"{base}[day]": str(value.day),
+        f"{base}[month]": str(value.month),
+        f"{base}[year]": str(value.year),
+    }
+
+
 def _collect_recording_links(soup: BeautifulSoup, links: list[dict], seen: set, course_info: dict) -> None:
     """Extrae las grabaciones de una página y las agrega a links (deduplicando por ID)."""
     for table in soup.find_all("table", class_="generaltable"):
@@ -446,7 +457,10 @@ def _moodle_recording_pages(session: requests.Session, initial_url: str) -> list
     queries: list[dict | None] = [None]
     if from_field and to_field:
         queries = [
-            {from_field: window_start, to_field: window_end}
+            {
+                **_moodle_date_params(from_field, window_start),
+                **_moodle_date_params(to_field, window_end),
+            }
             for window_start, window_end in _date_windows()
         ]
 
